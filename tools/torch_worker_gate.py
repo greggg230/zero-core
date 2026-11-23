@@ -1,4 +1,4 @@
-"""The torch worker's gate (docs/az.md 78.4; zero-farm's per-machine torch runtime): the torch worker's game records,
+"""The torch worker's gate (docs/az.md 80.4; zero-farm's per-machine torch runtime): the torch worker's game records,
 replayed by the trainer's path, against the rows the trainer's own local self-play produces for the same seed, game
 ids and network - row for row, every array bit for bit.
 

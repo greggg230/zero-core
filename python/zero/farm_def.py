@@ -62,7 +62,7 @@ MAX_ALTERNATES = 4                      # a run's alternates (PROTOCOL rev 11, 9
 VARIANT_RE = re.compile(r'^[a-z0-9][a-z0-9-]{0,31}$')
 MAX_VARIANTS = 8
 VARIANT_AGENT = '0.3.5'
-# a runtime pack's `opt_in` (zero-farm's per-machine torch runtime, docs/az.md 78): the machines the owner opted in
+# a runtime pack's `opt_in` (zero-farm's per-machine torch runtime, docs/az.md 80): the machines the owner opted in
 # take it; a run alternate on such a pack says so in `when.opt_in`
 OPT_IN_RE = re.compile(r'^[a-z0-9-]{1,32}$')
 FEATURE_ROLLING = 'rolling'               # a worker build that plays rolling self-play jobs (`info` features, PROTOCOL rev 15, 10.5)
@@ -481,7 +481,7 @@ def run_alternates(client, build_id, runtime, alt_builds, vendor=None):
     Each alternate's signed manifest (`build_manifest`) must be a worker build of the default build's game that
     requires a runtime pack (`requires_runtime`: the alternate's `runtime`), and that pack's manifest a runtime build.
     `when.vendor` is the pack's `gpu.vendor` (9.2), else `vendor` (the caller's, for a pack without `gpu`, which loads
-    anywhere); a pack with `opt_in` (the torch runtime, docs/az.md 78) adds `when.opt_in` (only the machines the owner
+    anywhere); a pack with `opt_in` (the torch runtime, docs/az.md 80) adds `when.opt_in` (only the machines the owner
     opted in take that alternate; order the alternates so it comes before the CUDA one); both given and different, or neither, is refused, as is a vendor that is not a profile vendor name
     (`VENDORS`). At most `MAX_ALTERNATES`, none the default build and none listed twice (the coordinator refuses an
     alternate equal to the default or to another; a definition's builds are distinct, at most 64: `validate`). No
@@ -548,7 +548,7 @@ def run_alternates(client, build_id, runtime, alt_builds, vendor=None):
         when = {'vendor': v}
         opt = pack.get('opt_in')
         if opt is not None:
-            # (an opted-in pack - the torch runtime, docs/az.md 78: only machines the owner opted in take it; the
+            # (an opted-in pack - the torch runtime, docs/az.md 80: only machines the owner opted in take it; the
             # alternate says so, and a pack's opt_in must equal its alternates' when.opt_in at the coordinator)
             if not isinstance(opt, str) or not OPT_IN_RE.match(opt):
                 raise SystemExit(f'alternate {b}: its pack {rt} names opt_in {opt!r}, not a name [a-z0-9-]{{1,32}}')

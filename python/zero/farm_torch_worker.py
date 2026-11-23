@@ -1,4 +1,4 @@
-"""The farm's torch worker (docs/az.md 78; zero-farm's per-machine torch runtime, PROTOCOL rev 27 draft): an `aw/1`
+"""The farm's torch worker (docs/az.md 80; zero-farm's per-machine torch runtime, PROTOCOL rev 27 draft): an `aw/1`
 self-play worker (zero-farm PROTOCOL.md 5, 10.5) that plays through the trainer's own inference path instead of
 ONNX Runtime - for the owner's machines whose GPU the native worker's graph leaves idle (an RTX 5090 reached ~0.4x of
 the trainer's torch self-play with it).
@@ -60,7 +60,7 @@ PROVIDER = {'cuda': 'torch-cuda', 'cpu': 'torch-cpu'}
 # GPU moves torch's CPU answers by float32 rounding; bfloat16 autocast (the trainer's infer_precision 'bf16') by
 # bfloat16's - measured on MTG Zero's meta3 network (gen 1334, 256 reference rows, an RTX 5090, CUDA graphs): largest
 # 0.078 (a value), means 1.4e-3 (priors), 9e-4 (value), 2.9e-3 (margin), 6e-6 (aux): the bounds leave ~2.5x / ~3.5x
-# room (docs/az.md 78); TF32 between the two. A broken evaluator misses by far more (a shifted reference: every number).
+# room (docs/az.md 80); TF32 between the two. A broken evaluator misses by far more (a shifted reference: every number).
 TOL = {'fp32': (1e-3, None), 'tf32': (5e-2, 3e-3), 'bf16': (0.2, 1e-2)}
 
 

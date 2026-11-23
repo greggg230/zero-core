@@ -1659,7 +1659,14 @@ class NetEvaluator:
         lg = plog[rows, acts].float()
         mx = torch.full((B,), -torch.inf, device=dev).scatter_reduce(0, rows, lg, 'amax', include_self=True)
         e = torch.exp(lg - mx[rows])
-        s = torch.zeros(B, device=dev).index_add_(0, rows, e)
+        # each leaf's sum of its options: on CUDA index_add_ adds an index's entries in whatever order its threads
+        # reach them (the priors' last bit then changes from call to call), segment_reduce adds each leaf's run in
+        # order - `rows` is sorted, a leaf's options are one run - and answers the same bits every time (docs/az.md
+        # 76); elsewhere index_add_ as before (in order on the CPU: the same bits as ever)
+        if torch.device(dev).type == 'cuda':
+            s = torch.segment_reduce(e, 'sum', lengths=cnt)
+        else:
+            s = torch.zeros(B, device=dev).index_add_(0, rows, e)
         pri = (e / s[rows]).cpu().numpy().astype(np.float32)
         val = torch.softmax(vlog.float(), dim=1)
         seats = self.model.seats

@@ -822,7 +822,10 @@ def test_cotrain_the_local_driver_is_never_starved(tmp_path):
     for b in mr[1:]:
         q = b['selfplay']['queue']
         tot = b['selfplay']['games'] + b['selfplay']['remote']['matches']
-        assert b['selfplay']['games'] >= 0.15 * tot, (b['selfplay']['games'], tot, q['consumers'])
+        # (what it guards against is a share of nothing; the share itself follows the two sides' speeds: on a desktop
+        # busy with other work it was 13.7 % to 23.4 % over the 16 iterations of 8 runs, so a 15 % bar failed half of
+        # them - docs/az.md 75.2)
+        assert b['selfplay']['games'] >= 0.10 * tot, (b['selfplay']['games'], tot, q['consumers'])
         assert q['consumers']['w0']['cap'] <= 80 and q['local_cap'] <= 32, q
 
 

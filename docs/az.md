@@ -27,7 +27,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `runctl.py` | PAUSE / STOP files, exit status 75, run / supervisor state files, `PauseWatch` |
 | `dashboard.py` | Flask dashboard (title, port and runs directory from the game package) |
 | `bench.py` | Throughput measurements (`infer`: batch sizes, concurrent workers, a checkpoint, the operators and multiply-adds of a forward pass; `train`: seconds per training step; section 10.5; `--graphs`: 10.6) |
-| `distill.py` | Distillation (section 13): a new network of another size or architecture trained on a run's shards to compute what a teacher computes (`new_student`, `outputs`, `distill`, `agreement`); the teacher's auxiliary head and value-only rows (13.6) |
+| `distill.py` | Distillation (section 13): a new network of another size or architecture trained on a run's shards to compute what a teacher computes (`new_student`, `outputs`, `distill`, `agreement`); the teacher's auxiliary head and value-only rows (13.6); several teachers, each on the rows a game package's row selector picks, in stratified batches (`select_rows`, `shares`, section 71) |
 | `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B), at a run's evaluation settings (each side's run's margin_w / redet / eval_cache, A's run's eval spec: section 44.3); each side's move rule its run's `eval_select` or `--select` / `--a-select` / `--b-select` (section 5.4); `--move-log`; paired games, per-side simulations, the sequential tests (`--paired`, `--a-sims` / `--b-sims`, `--sprt`, `--target-se`: `pair_stats`, `sprt_llr`, `sequential`; section 20.3); each side's CUDA graphs (`--graphs`, `--a-graphs` / `--b-graphs`, section 10.6) |
 | `heldout.py` | Held-out losses (section 20.2): a frozen set of sample rows (`make`), a checkpoint's value cross-entropy / accuracy / Brier against z and policy cross-entropy / top-1 against the recorded targets, decision and value-only rows apart (`HeldOut`, `losses`); `python -m <pkg>.az.heldout make | eval` |
 | `remote.py` | Remote evaluation (section 5.2): `RemoteEval` (the run's thread: queue, ship to the remote's mirror, run, results to `evals.jsonl`, Elo back), `RemoteNetEval` (a co-training run's `eval_yard_net`, 11.7), the remote side (`python -m <pkg>.az.remote eval MIRROR ITER`; `evalnet MIRROR ITER`; `selfplay MIRROR K`: remoteplay's worker), `Transport` (ssh / scp, or `local`) |
@@ -152,7 +152,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `pool_build`, `pool_runtime`, `pool_worker`, `pool_url`, `pool_max_stale`, `pool_quota`, `pool_slack`, `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_live_s`, `pool_min_agent`, `pool_alternates`, `pool_alt_vendor`, `pool_gpu_games_per_lease` | '', '', '', '', 1, 0, 0.1, auto, 1.0, 0, 10, '', '', 30, 900, 0.2.8, '', '', '' | the zero-farm pool, a `selfplay_remote` name `pool:<farm run>` (friends' idle PCs through the farm's coordinator; unused without one; section 45): the worker build (required) and its runtime, that build's executable here (its `check-config` picks the signed template's settings), the coordinator ('' = zero.farm_def's), the generations a farm game may lag (accepted into iteration i while its network >= i - 1 - pool_max_stale, else dropped), the coordinator's quota per generation (0 = `games`) and slack, games per lease, the run's farm priority, a lease's RAM, seconds between result polls, the data key and farm-release ('' = zero.farm_def's), the definitions' expiry in days; with `selfplay_local` 0 the pool takes the games while a valid game arrived within `pool_live_s` s; the farm run's `min_agent` (zero-farm PROTOCOL rev 9: its leases go only to agents at or above it; '' = none); the farm run's alternates (PROTOCOL rev 11: worker builds of the same engine signed for another runtime pack, comma-separated, at most 4; '' = none; a macOS build is a CPU alternate of its platform, rev 17, section 62) and the GPU vendor of those whose pack names none; the games of a GPU lease (`selfplay.gpu_games_per_lease`, rev 11: 'auto' or a number; '' = left out) (45.2) |
 | `pool_rolling` | 'auto' | the farm run's rolling self-play leases (zero-farm PROTOCOL rev 15, section 10: `selfplay.rolling`): a JSON object of `inflight`, `gpu_inflight` (1 to 4,096 or `auto`), `block`, `max_s`, `flush_s`, or `auto` = both in-flight counts `auto`; the worker build must announce the feature `rolling`, and the pool then judges staleness per row (rows of a network older than i - 1 - `pool_max_stale` dropped, the rest of the game kept); '' = off: classic leases, every PUT and judgement as before - and what a worker build without the feature needs (the pool refuses it while this is set); the default 'auto' since 2026-11-17 is a deliberate change (54.7); it matters only with a farm pool (`selfplay_remote` names `pool:`) (54) |
 | `pool_export` | '' | the graph the farm pool exports each generation as (`zero.onnx_export.GRAPHS`): '' the default graph, as before; 'fast' the fast zero-onnx/2 graph - TokenNet's own arithmetic, the same interface (plus the optional input `t_align`, 66), metadata (plus `fast`, `attention`, `t_align`) and answers within the parity gate's 2e-5, about half the CPU time (MultiHeadAttention, opset 17); 'fast-att23' (ONNX's opset-23 Attention: the fastest on the CPU, but the CUDA pack runs a dozen of its operators on the CPU) and 'fast-matmul'; each variant its own weight-swap template (its fingerprint); trainer-only: no worker build needs it; it matters only with a farm pool (63) |
-| `pool_variants` | '' | model variants the farm pool exports and registers beside each generation's graph (zero-farm PROTOCOL rev 20, 14): 'name=form[@vendor],...' (forms: 'fp16' - `onnx_export.to_float16` of the gen's graph; 'matmul' - the gen exported as graph 'fast-matmul', float32: the AMD GPUs' DirectML variant; 'matmul-fp16' - that graph in float16: DirectML on NVIDIA / Intel, 46.10; 'weights' - the gen's network as torch-weights/1 for the alternates whose pack is opted in, the farm's torch worker, 78); each signed in the definition (`checkpoints[gen].variants`) and registered (`variants`), the run's GPU alternates naming theirs (`model`: the variant of their vendor, else the first without `@vendor`), so with 'gpu=fp16,dml=matmul@amd' CUDA PCs play the fp16 graph, AMD PCs (DirectML) the float32 MatMul one and every other machine the default; raises the run's min_agent to 0.3.5 (agents before it refuse such a definition: the stable channel must have 0.3.5 first); trainer-only (67) |
+| `pool_variants` | '' | model variants the farm pool exports and registers beside each generation's graph (zero-farm PROTOCOL rev 20, 14): 'name=form[@vendor],...' (forms: 'fp16' - `onnx_export.to_float16` of the gen's graph; 'matmul' - the gen exported as graph 'fast-matmul', float32: the AMD GPUs' DirectML variant; 'matmul-fp16' - that graph in float16: DirectML on NVIDIA / Intel, 46.10; 'fixed-fp16' - the gen exported as graph 'fast-fixed', float16: CUDA PCs replay it as CUDA graphs, 79; 'fixed' - that graph in float32; 'weights' - the gen's network as torch-weights/1 for the alternates whose pack is opted in, the farm's torch worker, 80); each signed in the definition (`checkpoints[gen].variants`) and registered (`variants`), the run's GPU alternates naming theirs (`model`: the variant of their vendor, else the first without `@vendor`), so with 'gpu=fp16,dml=matmul@amd' CUDA PCs play the fp16 graph, AMD PCs (DirectML) the float32 MatMul one and every other machine the default; raises the run's min_agent to 0.3.5 (agents before it refuse such a definition: the stable channel must have 0.3.5 first); trainer-only (67) |
 | `selfplay_local_reason` | '' | why the run's self-play stays on this machine although the game package has a published farm build for its commit (`GamePackage.farm_build`): free text, logged at every start. Required (else refused, exit 78) at a fresh start and at a fork's first start when there is such a build and self-play names no farm pool; a resumed run only warns. `$ZERO_SELFPLAY_LOCAL_REASON` stands in for it (test harnesses, smokes; not saved). Trainer-only (70) |
 | `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); once STOP is there, the seconds the end of a phase still waits for the remote's last shards (later ones are dropped, the phase marked `cut`); without STOP it waits for every one (47.4; before 2026-11-12 this bound applied always) |
 | `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
@@ -9895,6 +9895,44 @@ release's DirectML self-test (`probe-providers --providers dml,cpu` on the re-ex
 the old reference set) fails with the release's worker and passes with this one (cpu and dml); the CUDA self-test's
 pair passes on both.
 
+### 73.2 A saved config read back resolves its games (remote workers, remote evaluations, eval jobs; MTG Zero's farm release, 2026-11-22)
+
+**Why.** A remote self-play worker (`remoteplay.Worker`) read its mirror's config.json as it was and played its `game`
+by name. A mirror the run writes names the game resolved (`resolve_config` before `_prepare_mirror`), but a config
+copied as it is - farm gate 2 (`tools/worker_parity.py`) copies the reference run's config.json into the worker's
+mirror, and that run's config, of before the change, names `mtg` with `game_layout` null - made the worker play `mtg`
+(layout 8) while the checkpoint loaded as `mtg_v7`: `a network of another encoding than this build's (game 'mtg_v7'
+-> 'mtg')`, exit 78, which failed MTG Zero's farm release at its gates for every build after layout v8 (gate 3, the
+native worker on the same config, resolved it and passed).
+
+**What it does.** `package.resolve_saved_games(cfg, where)`: a run's settings read back from a file name their
+resolved games, in place, as `resolve_run_game` resolves a resumed run's saved config - `game` with its
+`game_layout`, a co-training run's `resolver` with `resolver_cfg`'s record. A config written resolved reads back
+unchanged; an aliased name without a layout record is the name's old game. Its readers: `remoteplay.Worker` (its
+mirror's config.json; a layout record this checkout has no game for is refused in `main` as an EncodingMismatch:
+`error` kind `encoding`, exit 78 - this checkout is not the run's encoding), `remote.evaluate_mirror` and
+`evaluate_net_mirror` (`python -m <pkg>.az.remote eval|evalnet`: the mirror's config before the Run / CoRun is made;
+a bad record: EncodingMismatch, REFUSED), and `farm_eval.match_driver` (an eval job's settings, as the native
+worker's `game_of` resolves a job's: `tools/worker_eval_gate.py`'s Python side; a bad record: GameAliasError). The
+gate tools that drive the Python worker (`worker_parity.py`, `worker_bench.py`) go through `Worker` and resolve with
+it. The other readers audited were already resolved: the run's own config (`resolve_config`), network configs
+(`net.build`), h2h's run settings, the farm pool's headers, the held-out set, records and failures, farm_h2h, the
+gates' own config reads (`worker_records_gate.py`, `onnx_worker_gate.py`); a run's `cfg['game']` in a process is the
+resolved one.
+
+**Off by default.** Nothing to turn on: a config of an unaliased game, or one written resolved, reads back exactly as
+before.
+
+**Tests.** `tests/test_game_alias.py`: `resolve_saved_games` (old and new records, a resolver's, written configs read
+back as themselves, bad records refused); a remote Worker in-process on a mirror naming `toy_match` with
+`game_layout` null plays `toy` and loads a `toy` checkpoint (before: refused, the release's message), the record
+`toy_match` 1 plays `toy_match` and refuses a `toy` checkpoint, a record 4 is refused as `encoding`; the remote
+evaluation's mirror (both commands) and an eval job's match driver resolved; `tests/test_worker_settings.py`: the
+settings an eval match reads are now exactly the worker's `EVAL_READS`, `game_layout` included (it was left out:
+Python read the game unresolved). End to end: MTG Zero's farm gates on
+copies of the release's reference config and checkpoint with the release's worker - gate 2 fails before (exit 78,
+`'mtg_v7' -> 'mtg'`) and passes after (8 games, 534 rows, 200 batches identical), gate 3 passes on both (`mtg_v7`).
+
 ## 74. The fast graph's blocks of zeros as Pads (`ZeroOnnx2Fast.PAD_ZEROS`; no setting; zero-farm's CUDA PCs, 2026-11-22)
 
 **Why.** On a farm PC's NVIDIA GPU (the farm's CUDA pack, ONNX Runtime 1.24.4) the fast fp16 graph's call is bound by
@@ -9984,7 +10022,240 @@ target and no match too.
 gate an hour earlier, and every digest the gate's own - visits records 4c42f1160eca9121, cq records 88ab3306d3beba12
 (3,554 samples each, results e266d43f27caa1e8), the match f2a5103266c05aa6 (10/16).
 
-## 78. The farm's torch worker: aw/1 through the trainer's own inference path (`zero.farm_torch_worker`, `torch-weights/1`, `pool_variants` form 'weights'; zero-farm's per-machine torch runtime, 2026-11-22)
+### 75.2 `test_cotrain_the_local_driver_is_never_starved`: its bar from 15 % to 10 % (2026-11-22)
+
+The test starts a remote with four times the local resolver driver's room and asserts the local driver still plays
+at least 15 % of each iteration's matches (the fault it was written for: the desktop played none of 1,812). The share
+follows the two sides' speeds. On the desktop beside two live runs and a gate, 8 runs of the test's own scenario gave
+20.3 % to 23.4 % in the second iteration and 13.7 % to 17.4 % in the third - below the bar in 4 of the 8 - and in a
+sharded run of the suite it failed in its shard and again alone. The bar is now 10 %: a starved driver (0) still
+fails, and a busy machine no longer decides the result. Nothing but the test's number changes.
+
+## 76. The eager evaluator's priors on CUDA: the same bits every call (no setting; a behaviour change on that path, 2026-11-22)
+
+**What was wrong.** `NetEvaluator.evaluate`'s eager path (no CUDA graphs: `graphs=False`, or a batch the graphs do not
+take) softmaxes each leaf's options on the device, and a leaf's sum of its options was
+`torch.zeros(B).index_add_(0, rows, e)`. On CUDA `index_add_` adds the entries of one index in whatever order its
+threads reach them, so the sum's last bit - and then a prior's - changed from call to call on the same batch: 4
+different answers in 2,000 calls at 130 leaves, 2,000 different answers in 2,000 calls at 2,000 leaves; at most one
+unit in the last place of a float32 prior (6e-8). The network's own outputs were the same bits every call, as were the
+CUDA graphs' priors (softmaxed on the CPU) and the CPU's.
+
+**How it was found.** `tests/test_dup_reduce.py::test_max_is_deterministic_on_cuda_and_matches_the_cpu` (58) asserts
+the eager CUDA answer repeats bit for bit and failed on it, in 'max' and 'legacy' alike - nothing of the duplicate
+claims. The test runs only with a GPU visible, and MTG Zero's gate hides it, so it had not been run; the whole suite
+with the GPU visible (75) showed it.
+
+**The change.** On a CUDA device the sum is `torch.segment_reduce(e, 'sum', lengths=cnt)`: `rows` is sorted, a leaf's
+options are one run, and it adds each run in order - one answer in 2,000 calls at every size tried. Elsewhere the
+`index_add_` stays (on the CPU it adds in order: the same bits as ever, and `segment_reduce` there gives those bits
+too). **This changes behaviour on the eager CUDA path only**: its priors can differ in the last bit from the ones
+before, which already differed from call to call. No setting: there was no stable answer to preserve. The CPU, the
+CUDA graphs and the ONNX export are untouched. `zero.distill`'s loss has the same `index_add_`; a training loss, left
+as it is.
+
+**Tests and checks.** `tests/test_dup_reduce.py`: the test above passes; new
+`test_the_eager_evaluator_on_cuda_answers_the_same_bits_every_call` (both modes, 400 leaves, 300 calls) fails without
+the change (3 of the file's tests fail) and passes with it.
+The whole suite with the GPU visible, in four shards (75), beside two live runs: 834 passed, 31 skipped, the
+file's CUDA tests among them; one failure, `tests/test_remoteplay.py::test_cotrain_the_local_driver_is_never_starved`
+(the local driver's share of the games 25 of 167 against the 15 % it asserts), which times real threads (AGENTS.md)
+and passed 4 of 5 runs alone afterwards, with the GPU visible and hidden.
+
+## 77. Several teachers, each on its own rows: `tools/distill.py --sources`, the game package's row selector (no setting; `GamePackage.row_selectors`; MTG Zero's stew, its docs/ENGINE.md 222.1, 2026-11-21)
+
+**Why.** MTG Zero's stew (its docs/ENGINE.md 222) distils one network from several others, each the expert of
+some of the rows: a *deck stew* learns deck X from every specialist whose pairing includes X, on the rows where
+X's player acts; the *main stew* learns each row from the deck stew of the row's acting deck, plus a retention
+share from its own previous generation on the rows no specialist covers. Distillation (13) took one teacher and
+every row of its shards. This section takes several sources - each a teacher, its shards, a selection of their
+rows and a weight - in one distillation.
+
+**What it does.**
+
+```
+python tools/distill.py --sources SOURCES.json OUT.pt [--device cuda --torch-threads 4 --keep-best --resume --log L]
+```
+
+```json
+{"student": {"init": "<student start .pt>"},
+ "sources": [{"name": "spec:C|D",
+              "teacher": "<teacher .pt>",
+              "data": ["<run>/data", "<run>/data/iter_0042", "<shard.npz>"],
+              "select": {"actor": "C"},
+              "weight": 1.0,
+              "heldout": "auto",
+              "config": "<run>/config.json"}],
+ "heldout": "auto",
+ "train": {"steps": 20000, "batch": 512, "lr": 5e-4, "lr_min": 1e-5, "warmup": 500, "wd": 1e-4,
+           "teacher_w": 1.0, "value_q": 0.5, "margin_w": 0.5, "eval_every": 1000, "save_every": 2000,
+           "ram_budget_gb": 20, "seed": 1}}
+```
+
+* **The student**: `{"init": S.pt}` warm-starts from a checkpoint (its size; a missing head of the teachers' is
+  added, `net.add_aux`, as `--init`), or a fresh one of the size keys (`hidden`, `blocks`, `heads`, `ff`, `arch`,
+  `ch`; each default the first teacher's, as the size flags). Every teacher passes the encoding guard and the head
+  check (13.6); the teachers must be of one game and have the same auxiliary head or none (the student learns one
+  head), else refused.
+* **A source's rows**: `data` as `--data` (a run's data dir = every `iter_*`, one iteration, a shard file); `select`
+  `{}` = every row, else **the game package's row selector** decides each shard's rows (`zero.distill.select_rows`
+  -> `GamePackage.row_selectors[game]`: `fn(select, shard, ctx) -> numpy bool [rows]`, ctx = the shard's meta, its
+  run's config.json as a dict - `<run>/config.json` of `<run>/data/iter_NNNN/x.npz`, or the source's `config`,
+  None when neither exists -, its path and the source's name). The core knows nothing of a game's keys: the hook
+  must be exact and loud (an unknown key, a name the run does not have, a row it cannot decide: ValueError). A game
+  without the hook refuses a non-empty `select` (`... has no row selector for 'g' (select must be {})`); a mask of
+  the wrong length or dtype is refused. `heldout`: `"auto"` (the default, also the file's top-level key) = the
+  source's last shard (path order) with selected rows, `"none"`, or a list of paths as `--heldout` (their selected
+  rows; none selected: refused). A source left with no training rows is refused (never a silent 0-row source).
+* **One window** of every source's selected training rows (`data.Window(select=...)`: per shard its sorted row
+  numbers; the RAM budget subsamples the selected rows at one rate, as it does all rows), the sources' shards in
+  their order, so each source's rows are a contiguous range of it (a shard two sources take is loaded twice: its
+  selected rows of each).
+* **The teachers' answers**, once per row before training: each teacher on its own source's range only
+  (`outputs(model, W, span=(lo, hi), into=T)` - the answers of 13's `outputs`, written into the shared arrays), and
+  on its source's held-out rows; one teacher in memory at a time.
+* **Stratified batches**: every batch of `batch` rows holds `shares(weights, batch)` rows of each source (largest
+  remainders, the same split every step: exact to a row; a positive weight that gets no row is refused), drawn
+  uniformly with replacement from the source's range (`stratified_draw`, `distill(strata=)`, `data.batches(draw=)`),
+  so a source's share of the loss is its weight's whatever its row count. The loss is 13's (and 13.6's), per row
+  against that row's teacher.
+* **Held out, per source**: 13's `agreement` (KL(teacher || student) over the legal actions, its p90, top-1, P(win)
+  squared and absolute difference, margin, both networks' losses against the shards' targets; per kind of row and
+  per auxiliary target as 13.6) on each source's held-out rows against its own teacher, plus the weight-averaged
+  `policy_kl`, `top1`, `value_mse`, `value_mae`, `margin_mse` (`--keep-best` keeps the lowest averaged KL). In the
+  progress lines (`{"event": "heldout", "step", <averages>, "sources": {name: agreement}}`, stdout and
+  OUT.pt.log.jsonl; the start line lists each source's teacher, sha256, weight, rows a batch, rows of its shards,
+  selected and used, held-out rows) and in OUT.pt's `extra`: `distilled_from` (the sources file), `distill` =
+  {`sources_file`, `sources_sha256`, `sources`: [each source's name, teacher path and sha256, teacher net and
+  iteration, select, weight, rows a batch, config, its shards, rows (its training shards'), selected, used,
+  held-out shards and rows], `student_init` and its sha256, `settings`, `step`, `student_net`, `train_rows`,
+  `heldout` (every evaluation), `seconds`}.
+* **The training settings come from the file** (`train`: the keys above plus `epochs`, `aux_w`, `aux_teacher_w`,
+  `heldout_rows` - per source -, `report_every`; each default the flag's); their flags beside `--sources` are
+  refused, as are `--data`, `--heldout`, `--init` and the size flags. Process flags stay flags (`--device`,
+  `--torch-threads`, `--prefetch`, `--keep-best`, `--resume`, `--log`, `--normal-priority`, `--game`).
+  `OUT.pt.partial` records the sources file's sha256: `--resume` with another file is refused. Unknown keys
+  anywhere in the file are refused.
+
+**Off: nothing changes.** Without `--sources` the tool is the one of before: `Window(select=None)`,
+`batches(draw=None)`, `outputs(span=None)` and `distill(strata=None)` take their code paths of before, and the
+record's settings carry no new key (`--sources` is popped). **Byte for byte**: the single-teacher tool on
+deterministic toy shards (an MLP student; a token student at `teacher_w` 0.5 with `--keep-best`) gives the same
+student tensors, progress log and checkpoint record (paths and seconds aside) on this branch as on c850a5d (the
+commit before it, in a worktree of its own): `tests/test_distill_sources.py`'s goldens were recorded there by a
+script importing the test's generator, and the test compares against them (on the machine and torch they were
+recorded with - the desktop, torch 2.11.0+cu128; elsewhere it skips, naming the digests).
+
+**Costs.** A selection pass reads every shard of a selected source once more before the window (MTG Zero's
+selector: ~10 s a 65,536-row shard on the desktop's CPU, its ENGINE.md 222.1). RAM: the window's budget counts the
+selected rows only; a shard two sources take is held twice. The teachers' answers: one forward pass per row, as 13.
+
+**Tests** (`tests/test_distill_sources.py`, 11): the single-teacher tool byte for byte (2 goldens); `shares` and
+`stratified_draw` (the split, the refusals, each stratum's rows within its range); `Window(select=)` (the selected
+rows' features and targets exactly, the budget subsampling them, unsorted / empty selections refused); `outputs`
+with two teachers' spans = each teacher's answers on its rows; the hook (`select_rows`: a toy selector by seat,
+`{}` without a hook, an unknown key, a mask of the wrong length, no hook with a non-empty select; the run's
+config.json reaches it); the tool with two teachers on the first rounds' rows and the others' (weights 3:1, a
+student warm-started from a third network): the record and log (sha256s, rows selected = the selector's, rows a
+batch 48 / 16, the held-out shard and its rows, the weighted average), each source's KL to its own teacher down by
+more than 3x, and the student closer to each source's teacher than to the other on that source's rows; the
+weights set the shares (teachers that disagree on the same positions: the heavier source ends closer to its
+teacher, either way round); a fresh student, an explicit held-out list, a source without held-out shards and one
+without a selector, `--resume` (and a partial of another sources file refused); the refusals (training flags,
+unknown keys, a duplicate name, a zero weight, `init` with a size, a selector's own errors, a missing teacher, a
+source whose only rows are its held-out shard, a selection of nothing, no hook).
+
+**Measured** (MTG Zero, its ENGINE.md 222.1: its row selector on real metagame shards and a two-source distillation
+of best-of-three smoke runs).
+
+## 78. CUDA graphs for the static graph: fixed-shape buckets (WIP; worker env `ZERO_WORKER_CUDA_GRAPHS=1`; zero-farm's GPU PCs, 2026-11-22)
+
+**Why.** Measured on a farm PC (a 4-core / 8-thread CPU, an NVIDIA GPU, the farm's CUDA pack - ONNX Runtime 1.24.4 -,
+the fast fp16 graph of a live run's gen 769): one call costs the calling thread about its whole wall time - at 575 rows
+22.4 ms of CPU for 9.1 ms of GPU work, ~1,200 kernels launched one by one, 248 host <-> device copies and 27
+device -> host syncs (NonZero's data-dependent shapes) - so a crew of three workers is CPU-bound: its search costs what
+the trainer's does per leaf (133 vs 130 us) but its evaluators cost 96 us a leaf against the trainer's 30 (the trainer
+replays CUDA graphs, 10.6). The best crew reached 0.86x of the trainer's leaves/s; CUDA wait modes and ONNX Runtime's
+session and provider options changed nothing.
+
+**What (so far).**
+* *The static graph's ArgMax in float32* (`ZeroOnnx2Static.ARGMAX_DTYPE`): the override targets' match (0 / 1) is
+  ArgMax'ed in float32 - the same first index of the largest. With every symbolic dimension of the static graph fixed
+  (ONNX Runtime free-dimension overrides: B, nnz, K, NT, L, NO, T) its int64 ArgMax was its only node off the CUDA
+  provider (no int64 kernel), which keeps ONNX Runtime from capturing a CUDA graph. Every other graph keeps int64, byte
+  for byte.
+* *Buckets* (worker `cudagraph.rs`): a static graph on CUDA with `ZERO_WORKER_CUDA_GRAPHS=1` answers each piece through
+  a bucket - a session with those dimensions fixed to the bucket's capacities and CUDA graphs on, pinned host buffers
+  bound as its inputs and outputs (the replay copies from and to them). A piece is padded to its bucket with inert
+  padding rows after its own: non-zeros on global features (below the first head slot's present flag) with value 0,
+  options distinct actions, tail tokens valid ones (a tail segment, a slot below its count, sorted, no duplicate) whose
+  widths sum to exactly the padding floats (the graph refuses every row when the floats don't fit the widths: `lbad`),
+  overrides the generic logit of a padding row's option. A new bucket's capacities: the rows rounded up to 64 with at
+  least one padding row, each per-row quantity a quarter over the piece's mean, the tail floats 120 a padding token, T
+  the piece's; one that doesn't hold a piece of its T grows; at most 4 (least recently used goes). Off by default.
+
+**Checked.** The real rows' answers padded = unpadded, bit for bit (the CPU provider, 200 and 575 rows of the reference
+set); ONNX Runtime captures the fixed static fp16 graph on CUDA once its ArgMax is float32; unit tests of the tail
+padding plan and the padded sizes (`cudagraph::tests`).
+
+**Measured** (a farm PC: 4 cores / 8 threads, an NVIDIA GPU; gen 769 of a live run, fp16, real rows; the trainer's
+own path there 32.9k leaves/s).
+
+| | 352 rows | 575 rows | 1,024 rows |
+|---|---|---|---|
+| fast graph, one call (ms wall / thread CPU) | 16.4 / 16.2 | 21.8 / 21.6 | 33.3 / 33.1 |
+| static graph, fixed bucket, CUDA graph replay (ms, ~ its GPU time) | 14.3 | 27.0 | 56.5 |
+
+The answers are within the fp16 self-test (priors / value / margin / aux at most 5e-3 / 1.1e-2 / 1.5e-2 / 3.4e-3 off
+the fast graph's), deterministic, with no refusal. The worker's buckets pass its CUDA self-test (max abs 6.2e-3) and
+play: one worker of 704 games in flight 12.3k leaves/s at 31 % of the CPU - but a crew of 3 x 1,150 is **GPU-bound at
+9.8k (96 % busy)**, against 28.2k for the fast graph: the static graph's blocks run on every row padded to T tokens.
+So the static graph is not the CUDA-graph route; a packed graph of fixed capacity is (the fast graph's arithmetic with
+the packed token list's length an input-sized capacity - a cumsum and a scatter into N slots instead of NonZero), which
+the buckets here would run as they are.
+
+Pitfalls: pinned host buffers bound directly as a CUDA graph's inputs gave wrong answers (every real row refused) -
+device buffers with staging copies (ort's `Tensor::copy_into`) work; the self-test's small pieces need padding rows
+with tail slots enough (at least 16); bucket capacities grow while games ramp up (32 builds of ~0.55 s in a 2-minute
+single-worker run).
+
+**The fast graph's zeros as Pads**: measured in this series, shipped on its own - section 74.
+
+## 79. The fast graph at fixed capacities: graph 'fast-fixed' for CUDA graphs (`export(..., fast='fixed')`; the run setting `pool_variants` form 'fixed-fp16'; zero-farm's CUDA PCs, 2026-11-22)
+
+**Why.** Section 78's measurement: the static graph replays as one CUDA graph but is GPU-bound (every block on every
+row padded to T); the fast graph does the least GPU work but ONNX Runtime cannot capture it (NonZero and values read
+back for its sizes). This graph is the fast graph's arithmetic with every size an input's.
+
+**What.** `ZeroOnnx2FastFixed` (graph 'fast-fixed'): zero-onnx/2's inputs plus three whose lengths only are read -
+`s_cap` [S] (the batch's present head slots, the global tokens aside), `m_cap` [MR] (a row's most non-zeros in one run
+of features: the global ranges and the bag groups, metadata `runs`) and `t_cap` [T] (a row's most tokens, rounded up to
+the metadata's `t_align` as for the static graph). The present head slots go to the first of S slots by one scatter of
+unique places (their running count), the rest invalid (they read the first row's buffers and write only to spare
+places); each head segment's input map runs on all S slots, kept where the slot is the segment's (no NonZero per
+segment); the floats buffer is S x the widest slot; runs pad to MR; the attention's padded rows are T long, a token
+past T or an invalid slot scattered to a spare place. A batch past a capacity is refused: rows past T or MR, every row
+past S; the overrides' first-match ArgMax over float32 (ONNX Runtime's CUDA provider has no int64 ArgMax, and one CPU
+node stops the capture). Metadata `fixed` 1, `presence`, `t_align`, `runs`; no optional `t_align` input. The worker computes the
+capacities on the host (`StaticTokens::fixed_caps`: per row its present flags and two binary searches per run) and runs
+the graph through section 78's buckets with two capacities more (`S`, `MR`; a padding row's always-present slots count
+in S; padding non-zeros go to features in no run, value 0, so they count in no run).
+
+**How a run opts in** (off by default: no run exports it): the farm pool's variant form 'fixed-fp16' (`pool_variants`,
+46.10 / 67) - e.g. `pool_variants` 'gpu=fixed-fp16@nvidia' (with AMD PCs too: 'gpu=fixed-fp16@nvidia,dml=matmul@amd') -
+exports each generation again as graph 'fast-fixed' (its own weight-swap template and reference check), in float16,
+registers it as the run's NVIDIA (CUDA) alternate's model, and the worker turns its CUDA-graph buckets on by itself for
+a fixed graph on the CUDA provider (`cudagraph::wanted`; `ZERO_WORKER_CUDA_GRAPHS=0` turns them off, `=1` also turns
+them on for the static graph). Nothing to set on a farm PC; every other machine and run plays as before. Needs a worker
+build with this change (an older build does not feed the three capacity inputs: its self-test fails on the graph).
+
+**Checked.** `tests/test_onnx_fixed.py`: torch's answers within 2e-5 on the toy layouts and a rich one (both
+attentions, identity actions), the same answers (2e-6) for any capacities at least the batch's, the refusals where a
+capacity is short, no NonZero, its own weight-swap template. Gen 769 of a live run's network (CPU, fp32): within 4.4e-6
+of the fast graph's answers at 64 and 256 rows of the reference set, none refused. Worker unit tests of the padded
+sizes and capacities.
+
+## 80. The farm's torch worker: aw/1 through the trainer's own inference path (`zero.farm_torch_worker`, `torch-weights/1`, `pool_variants` form 'weights'; zero-farm's per-machine torch runtime, 2026-11-22)
 
 **Why.** On an RTX 5090 the native worker's ONNX graph plateaus at ~0.4x of the trainer's own torch self-play (MTG
 Zero's meta3 network: ~26 us of GPU per leaf for the ORT fp16 graph against ~9 us for torch bf16 with CUDA graphs). The

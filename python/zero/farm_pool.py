@@ -186,11 +186,16 @@ def alternate_ids(v):
 # graph 'fast-matmul' (onnx_export.GRAPHS: the fast graph with its attention as MatMuls - the one zero-onnx/2 graph
 # DirectML runs, docs/az.md 46.10), float32 - the AMD GPUs' form (zero-farm PROTOCOL rev 22: AMD GPUs through DirectML;
 # their DirectML answers the float16 copy non-deterministically, 46.10); 'matmul-fp16' = that graph in float16 (DirectML
-# on NVIDIA and Intel GPUs runs it deterministically); 'weights' = the gen's network as torch-weights/1 (zero.torch_weights:
-# the farm's torch worker, docs/az.md 78 - the form of the alternates whose runtime pack is opted in (`when.opt_in`), and
-# of no other machine: it is not a graph)
-VARIANT_FORMS = ('fp16', 'matmul-fp16', 'matmul', 'weights')
+# on NVIDIA and Intel GPUs runs it deterministically); 'fixed-fp16' = the gen exported as graph 'fast-fixed' (the fast graph
+# at fixed capacities, docs/az.md 79), float16 - the CUDA PCs' form: the worker replays it as CUDA graphs (one launch a call)
+# on its own, nothing else to set; 'fixed' = that graph, float32; 'weights' = the gen's network as torch-weights/1
+# (zero.torch_weights: the farm's torch worker, docs/az.md 80 - the form of the alternates whose runtime pack is opted in
+# (`when.opt_in`), and of no other machine: it is not a graph)
+VARIANT_FORMS = ('fp16', 'matmul-fp16', 'matmul', 'fixed-fp16', 'fixed', 'weights')
 WEIGHTS_FORM = 'weights'
+# a variant form exported again from the gen's checkpoint -> (its graph, zero.onnx_export.GRAPHS; then float16)
+_REEXPORT = {'matmul': ('fast-matmul', False), 'matmul-fp16': ('fast-matmul', True), 'fixed': ('fast-fixed', False),
+             'fixed-fp16': ('fast-fixed', True)}
 
 
 def variant_setting(v):
@@ -198,7 +203,7 @@ def variant_setting(v):
     '' / None -> []; 'name=form[@vendor][,...]' - each name `farm_def.VARIANT_RE`, distinct, at most `MAX_VARIANTS`; each
     form one of VARIANT_FORMS; `vendor` (optional, a profile vendor name `farm_def.VENDORS`) - the variant goes to the run's
     GPU alternates of that vendor; a variant without one to every other GPU alternate (the first such variant), None in
-    the triple. At most one variant per vendor. A 'weights' variant (the torch worker's, docs/az.md 78) takes no vendor and
+    the triple. At most one variant per vendor. A 'weights' variant (the torch worker's, docs/az.md 80) takes no vendor and
     counts in neither rule: it goes to the opted-in alternates (`variant_of`); at most one. ValueError otherwise."""
     if v is None or (isinstance(v, str) and not v.strip()):
         return []
@@ -211,7 +216,7 @@ def variant_setting(v):
                              f'{VARIANT_FORMS}, the vendor one of {FD.VENDORS}')
         if form == WEIGHTS_FORM and vendor:
             raise ValueError(f'variant {item!r}: a {WEIGHTS_FORM} variant takes no vendor (it goes to the opted-in '
-                             f'alternates: their pack\'s opt_in, docs/az.md 78)')
+                             f'alternates: their pack\'s opt_in, docs/az.md 80)')
         out.append((name, form, vendor or None))
     if sum(1 for _, f, _ in out if f == WEIGHTS_FORM) > 1:
         raise ValueError(f'variants {v!r}: at most one {WEIGHTS_FORM} variant')
@@ -225,7 +230,7 @@ def variant_setting(v):
 
 def variant_of(variants, vendor, opt_in=None):
     """The variant name a GPU alternate of `vendor` plays (`variant_setting`'s list): an opted-in alternate (`opt_in`, its
-    pack's: the torch worker, docs/az.md 78) the 'weights' variant, else None; any other the graph variant for its vendor,
+    pack's: the torch worker, docs/az.md 80) the 'weights' variant, else None; any other the graph variant for its vendor,
     else the first graph variant without a vendor, else None (the gen's default model)."""
     if opt_in:
         return next((n for n, f, _ in variants if f == WEIGHTS_FORM), None)
@@ -753,27 +758,29 @@ class Pool:
 
     def _make_variant(self, form, src, dst, ckpt=None, gen=None):
         """Gen `gen`'s variant in form `form` (VARIANT_FORMS) written to `dst`: from its graph `src` ('fp16'), or from
-        its checkpoint `ckpt` exported again as another graph ('matmul' / 'matmul-fp16': export_cached's graph
-        'fast-matmul' under <dst's dir>/v-<form>/, its own weight-swap template and check against the reference set;
-        'matmul-fp16' then float16), or its checkpoint as torch-weights/1 ('weights', zero.torch_weights)."""
+        its checkpoint `ckpt` exported again as another graph (`_REEXPORT`: 'matmul' / 'matmul-fp16' export_cached's
+        graph 'fast-matmul', 'fixed' / 'fixed-fp16' its graph 'fast-fixed', under <dst's dir>/v-<form>/, each its own
+        weight-swap template and check against the reference set; the '-fp16' forms then float16), or its checkpoint as
+        torch-weights/1 ('weights', zero.torch_weights)."""
         if form == WEIGHTS_FORM:
-            # (the torch worker's: the checkpoint's network and the run's inference settings, docs/az.md 78)
+            # (the torch worker's: the checkpoint's network and the run's inference settings, docs/az.md 80)
             from .torch_weights import export
             export(ckpt, dst, self.R.cfg, gen=gen)
             return
         from .onnx_export import to_float16
         if form == 'fp16':
             to_float16(src, dst)
-        elif form in ('matmul', 'matmul-fp16'):
+        elif form in _REEXPORT:
             from . import games as G
             from .farm_h2h import export_cached
+            graph, half = _REEXPORT[form]
             ex = export_cached(ckpt, gen, os.path.join(os.path.dirname(dst), f'v-{form}'), self.R.cfg['game'],
                                G.spec_json(self.R.cfg['spec']), os.path.join(self.dir, 'export'), f'{self.farm}/{gen}',
-                               checkpoint_iter=gen, graph='fast-matmul')
-            if form == 'matmul':
-                shutil.copyfile(ex['model'], dst)
-            else:
+                               checkpoint_iter=gen, graph=graph)
+            if half:
                 to_float16(ex['model'], dst)
+            else:
+                shutil.copyfile(ex['model'], dst)
         else:
             raise ValueError(f'variant form {form!r}')
 
@@ -881,7 +888,7 @@ class Pool:
                 platform_check(self.worker, self.R.cfg, os.path.join(self.dir, 'template'), p, self.log)
             opted = [x for x in alternates if x['when'].get('opt_in')]
             if opted and not any(f == WEIGHTS_FORM for _, f, _ in self.variants):
-                # (an opted-in pack runs the torch worker, docs/az.md 78: it plays nothing but its weights variant - the
+                # (an opted-in pack runs the torch worker, docs/az.md 80: it plays nothing but its weights variant - the
                 # gen's default graph would be refused by every such lease)
                 raise Refused(f"alternate {opted[0]['build_id']} is opted in ({opted[0]['when']['opt_in']}: the torch "
                               f"worker) but pool_variants has no {WEIGHTS_FORM} variant for it",

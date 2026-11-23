@@ -1997,6 +1997,15 @@ class Worker:
         self.rdir, self.k = rdir, k
         with open(os.path.join(rdir, 'config.json'), encoding='utf-8') as f:
             self.cfg = json.load(f)
+        # the mirror's game resolved (docs/az.md 73.2): a mirror the run wrote names it resolved, a config copied as it
+        # is (a run's of before the change: an aliased name without a layout record) is the name's old game - never
+        # the name's current revision; a layout record this checkout has no game for is refused in main (an
+        # EncodingMismatch: this checkout is not the run's encoding)
+        self.game_refused = None
+        try:
+            package.resolve_saved_games(self.cfg, f'the mirror {rdir}: config.json')
+        except package.GameAliasError as e:
+            self.game_refused = str(e)
         with open(os.path.join(rdir, 'selfplay.json'), encoding='utf-8') as f:
             self.sp = json.load(f)
         self.mode = self.sp.get('mode', 'selfplay')
@@ -2637,6 +2646,8 @@ class Worker:
         from .net import EncodingMismatch
         from .runctl import EXIT_REFUSED
         try:
+            if self.game_refused:
+                raise EncodingMismatch(self.game_refused)
             self._take_slot()
             self._setup()
             threading.Thread(target=self._stdin, name='zero-rsp-stdin', daemon=True).start()

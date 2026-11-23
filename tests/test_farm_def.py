@@ -293,7 +293,7 @@ def test_checkpoint_entries(tmp_path):
 
 
 def test_run_alternates_carry_an_opted_in_pack():
-    """The farm's torch runtime (docs/az.md 78): a runtime pack with `opt_in` makes its alternate's `when.opt_in`; a bad
+    """The farm's torch runtime (docs/az.md 80): a runtime pack with `opt_in` makes its alternate's `when.opt_in`; a bad
     name is refused; every other pack's alternate exactly as before (no key)."""
     cpu = {'manifest': 1, 'kind': 'runtime', 'version': 'ort-cpu', 'files': []}
     tp = {'manifest': 1, 'kind': 'runtime', 'version': 'torch-2.11.0-cu128-py313', 'opt_in': 'torch',

@@ -165,6 +165,13 @@ class GamePackage:
                     the game `before` (MTG Zero: {'mtg': {'layout': 8, 'before': 'mtg_v7'}}). Every game name in a
                     process is the resolved one (`resolve_game`); what is written names it with its `game_layout`
                     (`layout_stamp`). Default none: every name means what it always meant
+    row_selectors   game -> fn(select, shard, ctx) -> numpy bool [rows], or 'module:attr' (docs/az.md 77): a
+                    multi-source distillation's row selector (`zero.distill.select_rows`): which rows of shard
+                    `shard` (a path) the selector `select` (a non-empty dict of the game's own keys, e.g. MTG
+                    Zero's {"actor": <deck name>}) takes; ctx {'meta': the shard's meta, 'config': its run's
+                    config.json as a dict (or None), 'config_path', 'source': the source's name}. It must be
+                    exact and loud: an unknown key, a name the run does not have, or a row it cannot decide
+                    raises (ValueError). Default none: a source's `select` must be {} (every row)
     """
 
     def __init__(self, name, title, root, engine=None, run_module=None, game='toy', specs=None,
@@ -173,7 +180,7 @@ class GamePackage:
                  grids=None, remotes=None, tokens=None, eval_specs=None, deferred=None, evals=None, aux=None,
                  replay_aux=None, readers=None, remote_eval_files=None, settings=None, selfplay_specs=None,
                  remote_eval_inputs=None, evals_every=None, companion=None, on_fork=None, engine_paths=None,
-                 setting_classes=None, h2h_backend=None, farm_build=None, game_aliases=None):
+                 setting_classes=None, h2h_backend=None, farm_build=None, game_aliases=None, row_selectors=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -226,6 +233,7 @@ class GamePackage:
                 raise ValueError(f'{name}: game_aliases of {g!r}: before {before!r} is not another game (nor an '
                                  f'aliased name)')
             self.game_aliases[g] = {'layout': rev, 'before': before}
+        self.row_selectors = dict(row_selectors or {})
         for k, c in self.setting_classes.items():
             if k not in self.settings:
                 raise ValueError(f'{name}: setting_classes names {k!r}, which is not one of the package\'s settings')
@@ -294,6 +302,13 @@ class GamePackage:
             return True
         n = int(cfg.get(s, self.settings[s]) or 0)
         return n > 0 and int(it) % n == 0
+
+    def row_selector_of(self, game):
+        """`game`'s row selector fn(select, shard, ctx) -> bool [rows] (`row_selectors`, docs/az.md 77), or None."""
+        f = self.row_selectors.get(game)
+        if isinstance(f, str):
+            f = self.row_selectors[game] = resolve(f)
+        return f
 
     def selfplay_spec_fn(self, game):
         """`game`'s self-play spec hook fn(run, it) -> spec JSON or None (`selfplay_specs`), or None."""
@@ -618,6 +633,24 @@ def set_game(d, game):
     elif 'game_layout' in d:
         d['game_layout'] = None
     return d
+
+
+def resolve_saved_games(cfg, where=''):
+    """A run's settings read back from a file (a remote's mirror config.json, an eval job's settings) naming their
+    resolved games, in place (docs/az.md 73.2) - as `zero.run.resolve_run_game` resolves a resumed run's saved config:
+    its `game` with its `game_layout` (`set_game`), a co-training run's `resolver` with `resolver_cfg`'s. A config
+    written resolved (the run's own, a mirror the run wrote) reads back unchanged; one naming an aliased game without a
+    layout record (a run's config of before the change, copied as it is) is the name's old game. A record no game of
+    this build has: GameAliasError. Returns `cfg`."""
+    if cfg.get('game'):
+        set_game(cfg, record_game(cfg, where))
+    if cfg.get('resolver'):
+        rc = dict(cfg.get('resolver_cfg') or {})
+        rgame = resolve_game(cfg['resolver'], rc.get('game_layout'), f'{where}: resolver' if where else 'resolver')
+        rc.pop('game_layout', None)
+        rc.update(layout_stamp(rgame))
+        cfg['resolver'], cfg['resolver_cfg'] = rgame, rc
+    return cfg
 
 
 def resolve(obj):

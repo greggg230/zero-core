@@ -321,6 +321,19 @@ def varlen_feeds(rows, sizes=None):
         n = presence_sparse(rows, sizes['presence']).sum(1) + np.diff(f['t_off'])
         T = static_t(n, sizes.get('t_align', 1))
         f['t_cap'] = np.zeros(T, np.int32)
+        if sizes.get('fixed'):
+            # (the fixed graph's other capacities, docs/az.md 79: the batch's present head slots, a row's most
+            # non-zeros in one of the metadata's runs of features - exact, as a feeder computes them)
+            P = presence_sparse(rows, sizes['presence'])
+            f['s_cap'] = np.zeros(max(1, int(P[:, 1:].sum())), np.int32)
+            idx = rows.xs_idx.astype(np.int64)
+            r = np.repeat(np.arange(B), np.diff(rows.xs_off))
+            mr = 1
+            for lo, hi in sizes['runs']:
+                hit = (idx >= lo) & (idx < hi)
+                if hit.any():
+                    mr = max(mr, int(np.bincount(r[hit], minlength=B).max()))
+            f['m_cap'] = np.zeros(mr, np.int32)
         if B * (T + len(sizes['presence']) + 1) + len(f['t_seg']) + 1 > INT32_MAX:
             raise ValueError(f'a piece of {B} rows padded to {T} tokens: places of the static graph pass 2^31')
     if sizes is not None:
@@ -338,10 +351,14 @@ def graph_sizes(sess):
         return None
     m = sess.get_modelmeta().custom_metadata_map
     out = {'actions': int(m['actions']), 'tail_width': int(m.get('tail_width') or 0)}
-    if m.get('static') == '1':
-        # (the static graph's: what its t_cap is computed from, docs/az.md 67)
+    if m.get('static') == '1' or m.get('fixed') == '1':
+        # (the static graph's: what its t_cap is computed from, docs/az.md 67; the fixed graph's also s_cap and m_cap,
+        # docs/az.md 79)
         out['presence'] = json.loads(m['presence'])
         out['t_align'] = int(m.get('t_align') or 1)
+        if m.get('fixed') == '1':
+            out['fixed'] = True
+            out['runs'] = json.loads(m['runs'])
     return out
 
 

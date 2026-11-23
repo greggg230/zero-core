@@ -872,6 +872,9 @@ pub struct StaticTokens {
     pub flag: Vec<bool>,
     /// Head positions in all (the global token and every slot).
     pub n_tok: usize,
+    /// The fixed graph's (metadata `fixed` 1, zero-core docs/az.md 79): the runs of features [lo, hi) it reads a row's
+    /// non-zeros in (metadata `runs`); empty for the static graph.
+    pub runs: Vec<(usize, usize)>,
 }
 
 impl StaticTokens {
@@ -886,13 +889,61 @@ impl StaticTokens {
         let a = align.max(1);
         most.div_ceil(a) * a
     }
+
+    /// The fixed graph's tokens (not the static graph's).
+    pub fn fixed(&self) -> bool {
+        !self.runs.is_empty()
+    }
+
+    /// The fixed graph's other capacities for a piece: (its present head slots, the global tokens aside; a row's most
+    /// non-zeros in one run, at least 1) - a row's features ascend, so a run's are a slice found by two binary searches.
+    pub fn fixed_caps(&self, b: &Batch, idx: &[usize]) -> (usize, usize) {
+        let (mut s, mut mr) = (0usize, 1usize);
+        for &r in idx {
+            let (lo, hi) = (b.xs_off[r] as usize, b.xs_off[r + 1] as usize);
+            let row = &b.xs_idx[lo..hi];
+            s += self.always - 1 + (lo..hi).filter(|&j| self.flag.get(b.xs_idx[j] as usize).copied().unwrap_or(false) && b.xs_val[j] > 0.5).count();
+            for &(a, z) in &self.runs {
+                let i0 = row.partition_point(|&f| (f as usize) < a);
+                let i1 = row.partition_point(|&f| (f as usize) < z);
+                mr = mr.max(i1 - i0);
+            }
+        }
+        (s.max(1), mr)
+    }
+
+    /// The features a padding row's non-zeros may go to: the static graph's those below the first head slot's present
+    /// flag (no token's); the fixed graph's those in no run (value 0 is inert on any other feature).
+    pub fn pad_features(&self) -> Vec<i32> {
+        if self.fixed() {
+            (0..self.flag.len()).filter(|&f| !self.runs.iter().any(|&(a, z)| a <= f && f < z)).map(|f| f as i32).collect()
+        } else {
+            let global = self.flag.iter().position(|&f| f).unwrap_or(self.flag.len()).max(1);
+            (0..global as i32).collect()
+        }
+    }
 }
 
-/// A graph's [`StaticTokens`] (metadata `static` 1), None for any other graph.
+/// A graph's [`StaticTokens`] (metadata `static` 1, or `fixed` 1 with its `runs`), None for any other graph.
 pub fn static_of(meta: &[(String, String)], path: &Path, features: usize) -> Result<Option<StaticTokens>, String> {
     let get = |k: &str| meta.iter().find(|e| e.0 == k).map(|e| e.1.as_str());
-    if get("static") != Some("1") {
+    let fixed = get("fixed") == Some("1");
+    if get("static") != Some("1") && !fixed {
         return Ok(None);
+    }
+    let mut runs = Vec::new();
+    if fixed {
+        let raw: Vec<(usize, usize)> = serde_json::from_str(get("runs").ok_or_else(|| format!("{}: a fixed graph without metadata runs", path.display()))?).map_err(|e| format!("{}: metadata runs: {e}", path.display()))?;
+        for (a, z) in raw {
+            if a >= z || z > features {
+                return Err(format!("{}: metadata runs: [{a}, {z}) of {features} features", path.display()));
+            }
+            runs.push((a, z));
+        }
+        if runs.is_empty() {
+            // (a network without global features or bags: still the fixed graph's inputs; no feature is in a run)
+            runs.push((features, features));
+        }
     }
     let pres: Vec<i64> = serde_json::from_str(get("presence").ok_or_else(|| format!("{}: a static graph without metadata presence", path.display()))?).map_err(|e| format!("{}: metadata presence: {e}", path.display()))?;
     let mut flag = vec![false; features];
@@ -904,7 +955,7 @@ pub fn static_of(meta: &[(String, String)], path: &Path, features: usize) -> Res
             Err(_) => always += 1,
         }
     }
-    Ok(Some(StaticTokens { always, flag, n_tok: pres.len() + 1 }))
+    Ok(Some(StaticTokens { always, flag, n_tok: pres.len() + 1, runs }))
 }
 
 /// The graph's metadata and inputs / outputs checked against `want` (phase 0a's "For phase 0b" point 1; zero-onnx/2:
@@ -934,7 +985,13 @@ fn check_graph(s: &Session, meta: &[(String, String)], path: &Path, want: &Expec
         return Err(format!("{}: a seat takes the root's belief but the network has no auxiliary head for the game's targets (aux_width {w}, need {}): HeadMissing", path.display(), want.aux_width));
     }
     let more: &[&str] = if v2 { &VARLEN_INPUTS } else { &[] };
-    let stat: &[&str] = if v2 && get("static") == Some("1") { &["t_cap"] } else { &[] };
+    let stat: &[&str] = if v2 && get("static") == Some("1") {
+        &["t_cap"]
+    } else if v2 && get("fixed") == Some("1") {
+        &["s_cap", "m_cap", "t_cap"]
+    } else {
+        &[]
+    };
     for name in ["x_ptr", "x_idx", "x_val", "n_players", "belief"].iter().chain(more).chain(stat) {
         if !s.inputs().iter().any(|i| i.name() == *name) {
             return Err(format!("{}: no input {name:?}", path.display()));
@@ -985,6 +1042,9 @@ pub struct InferenceSession {
     pub t_align: Option<i64>,
     /// A static graph's tokens per row (`static_of`), None for any other graph.
     pub static_tok: Option<StaticTokens>,
+    /// A static graph on CUDA with `ZERO_WORKER_CUDA_GRAPHS=1`: its fixed-shape buckets, each a captured CUDA graph
+    /// (`cudagraph`, docs/az.md 78 WIP).
+    pub graphs: Option<crate::cudagraph::Cache>,
 }
 
 /// The value fed to a fast graph's optional input `t_align` (zero-core docs/az.md 66: its padded rows' token axis a
@@ -1065,6 +1125,57 @@ fn self_test(s: &mut InferenceSession, r: &crate::selftest::Reference, fallback:
 }
 
 /// Create the session a job evaluates with (the module docs; PROTOCOL.md 8).
+/// A static or fixed graph's CUDA-graph buckets when they are wanted (`cudagraph::wanted`: a fixed graph's by default)
+/// and possible: a CUDA session of such a graph whose metadata names its tails.
+fn graph_cache(s: &InferenceSession) -> Option<crate::cudagraph::Cache> {
+    if s.provider != ProviderKind::Cuda {
+        return None;
+    }
+    let st = s.static_tok.as_ref()?;
+    if !crate::cudagraph::wanted(st.fixed(), std::env::var(crate::cudagraph::ENV).ok().as_deref()) {
+        return None;
+    }
+    let ord = match &s.binding {
+        Binding::Named(ProviderKind::Cuda, o) => *o as i32,
+        _ => return None,
+    };
+    let tails = match crate::cudagraph::Tails::of(&s.meta) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[zero-worker] {}: no CUDA graphs: {e}", crate::cudagraph::ENV);
+            return None;
+        }
+    };
+    let kind = if st.fixed() { "fixed" } else { "static" };
+    eprintln!("[zero-worker] the {kind} graph's calls replay CUDA graphs (buckets of fixed shapes; {}=0 turns them off)", crate::cudagraph::ENV);
+    Some(crate::cudagraph::Cache { path: s.path.clone(), ord, tails, actions: s.actions, aux_w: s.aux_w, pad_features: st.pad_features(), always_extra: st.always - 1, buckets: Vec::new(), built: 0, tick: 0 })
+}
+
+/// One bucket's session: the CUDA provider with CUDA graphs on, every symbolic dimension of the static graph fixed to
+/// the bucket's capacities (ONNX Runtime free-dimension overrides), the job's session options otherwise.
+fn graph_session(rt: &Runtime, ord: u32, threads: usize, path: &Path, caps: &crate::cudagraph::Caps) -> Result<Session, String> {
+    let mut sb = Session::builder(&rt.env).map_err(oerr)?;
+    sb = sb.with_intra_threads(threads.max(1)).map_err(oerr)?;
+    sb = sb.with_inter_threads(1).map_err(oerr)?;
+    sb = sb.with_parallel_execution(false).map_err(oerr)?;
+    sb = sb.with_optimization_level(GraphOptimizationLevel::All).map_err(oerr)?;
+    sb = sb.with_intra_op_spinning(false).map_err(oerr)?;
+    sb = sb.with_memory_pattern(false).map_err(oerr)?;
+    sb = sb.with_deterministic_compute(true).map_err(oerr)?;
+    for (k, v) in [("B", caps.b), ("nnz", caps.nnz), ("K", caps.k), ("NT", caps.nt), ("L", caps.l), ("NO", caps.no), ("T", caps.t), ("S", caps.s), ("MR", caps.mr)] {
+        // (S and MR the fixed graph's only)
+        if v > 0 || !matches!(k, "S" | "MR") {
+            sb = sb.with_dimension_override(k, v as i64).map_err(oerr)?;
+        }
+    }
+    let ep = ort::ep::CUDA::default().with_device_id(ord as i32).with_tf32(false).with_conv_algorithm_search(ort::ep::cuda::ConvAlgorithmSearch::Default).with_cuda_graph(true);
+    sb = sb.with_execution_providers([ep.build().error_on_failure()]).map_err(oerr)?;
+    let t0 = Instant::now();
+    let s = sb.commit_from_file(path).map_err(|e| format!("{}: {}", path.display(), oerr(e)))?;
+    eprintln!("[zero-worker] CUDA graph bucket {caps:?} built in {:.2} s", t0.elapsed().as_secs_f64());
+    Ok(s)
+}
+
 pub fn create_session(spec: &SessionSpec) -> Result<InferenceSession, SessionError> {
     let rt = runtime(spec.runtime)?;
     let reference = match spec.reference {
@@ -1244,7 +1355,9 @@ pub fn try_one(rt: &'static Runtime, spec: &SessionSpec, reference: Option<&crat
         max_nnz: (p == ProviderKind::TensorRtRtx).then_some(NVRTX_MAX_NNZ),
         t_align,
         static_tok,
+        graphs: None,
     };
+    s.graphs = graph_cache(&s);
     if let Some(r) = reference {
         match self_test(&mut s, r, fallback, build_s) {
             Ok(st) => s.selftest = st,
@@ -1362,7 +1475,32 @@ impl InferenceSession {
             }
             _ => None,
         };
+        // (the fixed graph's other capacities, zero-core docs/az.md 79)
+        let (s_cap, m_cap) = match &self.static_tok {
+            Some(st) if st.fixed() && vr.is_some() => st.fixed_caps(b, idx),
+            _ => (0, 0),
+        };
         let v2 = vr.is_some();
+        if let (Some(_), Some(v), Some(t)) = (self.graphs.as_ref(), vr.as_ref(), t_cap) {
+            let piece = crate::cudagraph::Piece {
+                x_ptr, x_idx, x_val, n_players: np, belief: bel,
+                opt_off: v.opt_off.clone(), opt_action: v.opt_action.clone(), t_off: v.t_off.clone(), t_seg: v.t_seg.clone(),
+                t_slot_hi: v.t_slot_hi.clone(), t_slot_lo: v.t_slot_lo.clone(), t_val: v.t_val.clone(), ov_off: v.ov_off.clone(),
+                ov_opt: v.ov_opt.clone(), ov_seg: v.ov_seg.clone(), ov_col: v.ov_col.clone(), ov_slot_hi: v.ov_slot_hi.clone(),
+                ov_slot_lo: v.ov_slot_lo.clone(), t, s: s_cap, mr: m_cap,
+            };
+            let (rt, threads) = (self.rt, self.threads);
+            let ord = match &self.binding {
+                Binding::Named(ProviderKind::Cuda, o) => *o,
+                _ => return Err("CUDA graphs on a session that isn't CUDA's".into()),
+            };
+            let make = move |path: &Path, caps: &crate::cudagraph::Caps| -> Result<Session, String> { graph_session(rt, ord, threads, path, caps) };
+            let (pol, val, mar, aux, refused) = self.graphs.as_mut().expect("checked").run(&piece, &make)?;
+            if let Some(k) = refused.iter().position(|&x| x != 0) {
+                return Err(format!("the network refused {} tail token(s) / pointer override(s) of this batch (first: row {}): not tokens / targets it takes (zero-core docs/az.md 46)", refused.iter().sum::<i64>(), idx[k]));
+            }
+            return Ok((pol, val, mar, aux));
+        }
         let s = self.ensure()?;
         let mut inputs = ort::inputs![
             "x_ptr" => Tensor::from_array((vec![n as i64 + 1], x_ptr)).map_err(oerr)?,
@@ -1391,8 +1529,15 @@ impl InferenceSession {
                 "ov_slot_lo" => Tensor::from_array((len(v.ov_slot_lo.len()), v.ov_slot_lo)).map_err(oerr)?,
             ]);
             if let Some(t) = t_cap {
-                // (the static graph's input: only its length is read, zero-core docs/az.md 67)
+                // (the static graph's input: only its length is read, zero-core docs/az.md 67; the fixed graph's two
+                // more, docs/az.md 79)
                 inputs.extend(ort::inputs!["t_cap" => Tensor::from_array((vec![t as i64], vec![0i32; t])).map_err(oerr)?]);
+                if m_cap > 0 {
+                    inputs.extend(ort::inputs![
+                        "s_cap" => Tensor::from_array((vec![s_cap as i64], vec![0i32; s_cap])).map_err(oerr)?,
+                        "m_cap" => Tensor::from_array((vec![m_cap as i64], vec![0i32; m_cap])).map_err(oerr)?,
+                    ]);
+                }
             } else if let Some(a) = t_align {
                 // (the fast graph's optional input, a GPU's: zero-core docs/az.md 66)
                 inputs.extend(ort::inputs!["t_align" => Tensor::from_array((Vec::<i64>::new(), vec![a])).map_err(oerr)?]);

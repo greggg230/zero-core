@@ -1071,7 +1071,7 @@ impl PySearchDriver {
     }
 
     /// A rolling driver's first game id (`Driver::set_first_gid`): its games are `gid`, `gid + 1`, ... - before the
-    /// first resume. The farm's torch worker (zero.farm_torch_worker, docs/az.md 78): a job's ids from its
+    /// first resume. The farm's torch worker (zero.farm_torch_worker, docs/az.md 80): a job's ids from its
     /// `gid_base`, as the native worker's driver numbers them.
     fn set_first_gid(&mut self, gid: u32) -> PyResult<()> {
         self.d.set_first_gid(gid).map_err(verr)

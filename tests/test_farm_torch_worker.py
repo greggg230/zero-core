@@ -1,4 +1,4 @@
-"""The farm's torch worker (zero.farm_torch_worker, docs/az.md 78) on the toy and a small CPU network: aw/1's hello before
+"""The farm's torch worker (zero.farm_torch_worker, docs/az.md 80) on the toy and a small CPU network: aw/1's hello before
 torch, a job's records replayed by the trainer's path equal to the trainer's local self-play rows (fp32, deterministic
 batches), the model refusal, the self-test, a rolling job's checkpoint / yield / resume / extend / finish, quit, a failed
 resume, and the torch-weights/1 file."""

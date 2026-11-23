@@ -1,4 +1,4 @@
-"""`torch-weights/1`: a generation's network as the farm's torch worker loads it (docs/az.md 78; zero-farm's per-machine
+"""`torch-weights/1`: a generation's network as the farm's torch worker loads it (docs/az.md 80; zero-farm's per-machine
 torch runtime). A model variant (zero-farm PROTOCOL rev 20, 14) of form 'weights' (the run setting `pool_variants`
 'torch=weights', zero.farm_pool): the checkpoint's network - its config and weights - without the optimizer state or
 anything else of the checkpoint, plus the run's own inference settings, so a worker plays the gen exactly as the
