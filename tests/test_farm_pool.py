@@ -809,6 +809,72 @@ def test_rolling_check_never_runs_another_platforms_executable(tmp_path, monkeyp
     assert any('the worker build plays rolling jobs' in x for x in lines)
 
 
+# a stand-in for a torch worker build's entry (zero-farm PROTOCOL 19.4, zf-pyshim.exe): it answers nothing without
+# ZEROFARM_RUNTIME_DIR naming a directory that holds python/python.exe (exit 3, one stderr line), then `info` as the
+# worker run by the pack's Python would
+_SHIM = '''import json, os, sys
+d = os.environ.get('ZEROFARM_RUNTIME_DIR')
+if not d:
+    sys.stderr.write('zf-pyshim: ZEROFARM_RUNTIME_DIR is not set: the agent sets it for every worker it starts\\n')
+    sys.exit(3)
+if not os.path.isfile(os.path.join(d, 'python', 'python.exe')):
+    sys.stderr.write('zf-pyshim: ZEROFARM_RUNTIME_DIR ' + d + ' holds no python\\\\python.exe\\n')
+    sys.exit(3)
+print(json.dumps({'build_id': os.path.basename(os.path.dirname(os.path.abspath(__file__))), 'kinds': ['selfplay'],
+                  'features': FEATURES, 'runtime': 'torch', 'pack': os.path.basename(d)}))
+'''
+
+
+@pytest.mark.parametrize('pack', ['here', 'missing', 'empty', 'no-rolling', 'broken'])
+def test_rolling_check_runs_a_torch_alternate_from_its_runtime_pack(tmp_path, monkeypatch, pack):
+    """A torch alternate's entry (zf-pyshim) answers nothing without ZEROFARM_RUNTIME_DIR, its runtime pack's directory
+    (docs/az.md 81.1: the pool took that for a definitive refusal and stopped, the run going on without the farm). The
+    check gives the alternate its pack - the manifest's `requires_runtime`, published next to the worker builds - for
+    that call only; a pack that is not on this machine (or not whole) leaves the alternate unchecked, logged, as an
+    executable that is not here; a torch worker without `rolling`, or one that fails for another reason, still refuses."""
+    host = FD.host_platform() or 'windows-x64'
+    monkeypatch.setattr(FD, 'host_platform', lambda: host)
+    monkeypatch.delenv(FP.RUNTIME_DIR_ENV, raising=False)
+    base, talt, rt = 'a' * 24, 'e' * 24, 'f' * 24
+    feats = [] if pack == 'no-rolling' else [FD.FEATURE_ROLLING]
+    native = ("import json, os\nprint(json.dumps({'build_id': os.path.basename(os.path.dirname(os.path.abspath(__file__))),"
+              " 'features': FEATURES}))\n")
+    for b, body in ((base, native), (talt, _SHIM)):
+        os.makedirs(tmp_path / b)
+        (tmp_path / b / 'w.py').write_text(body.replace('FEATURES', repr(feats if b == talt else [FD.FEATURE_ROLLING])))
+    if pack == 'broken':                      # (the pack is here and whole, and the worker fails on its own)
+        (tmp_path / talt / 'w.py').write_text('import sys\nsys.stderr.write("worker_main.py: no engine\\n")\nsys.exit(4)\n')
+    if pack != 'missing':
+        os.makedirs(tmp_path / rt / 'python')
+        if pack != 'empty':
+            (tmp_path / rt / 'python' / 'python.exe').write_bytes(b'')
+    sha = {b: FD.file_sha256(str(tmp_path / b / 'w.py')) for b in (base, talt)}
+    mans = {base: {'entry': 'w.py', 'files': [{'path': 'w.py', 'sha256': sha[base]}]},
+            talt: {'entry': 'w.py', 'platform': host, 'requires_runtime': rt,
+                   'files': [{'path': 'w.py', 'sha256': sha[talt]}]}}
+    monkeypatch.setattr(FD, 'build_manifest', lambda client, b: mans[b])
+    lines = []
+    p = types.SimpleNamespace(worker=str(tmp_path / base / 'w.py'), build=base, alt_builds=[talt], client=None,
+                              rolling={'inflight': 'auto'}, log=lines.append)
+    if pack in ('no-rolling', 'broken'):
+        with pytest.raises(FP.Refused) as e:
+            FP.Pool._check_rolling(p)
+        assert f'alternate {talt}' in e.value.reason if pack == 'no-rolling' else 'no engine' in e.value.reason
+        return
+    FP.Pool._check_rolling(p)
+    unchecked = [x for x in lines if 'unchecked' in x]
+    if pack == 'here':
+        assert not unchecked, unchecked
+        assert FP.worker_features(str(tmp_path / talt / 'w.py'), str(tmp_path / rt)) == ([FD.FEATURE_ROLLING], talt)
+    else:
+        assert len(unchecked) == 1 and f'alternate {talt}' in unchecked[0] and f'runtime pack {rt}' in unchecked[0]
+        assert ('not whole on this machine' in unchecked[0]) == (pack == 'empty')
+    assert any('the worker build plays rolling jobs' in x for x in lines)
+    assert FP.RUNTIME_DIR_ENV not in os.environ, 'the variable is the call\'s only, never this process\'s'
+    with pytest.raises(FP.Refused, match='ZEROFARM_RUNTIME_DIR is not set'):
+        FP.worker_features(str(tmp_path / talt / 'w.py'))
+
+
 @pytest.mark.parametrize('setting', ['default', ''])
 def test_default_pool_rolling_is_auto(pool, monkeypatch, setting):
     """The deliberate default of 2026-11-17 (docs/az.md 54.7): a farm pool with the default `pool_rolling` ('auto')

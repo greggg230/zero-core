@@ -63,7 +63,9 @@ the keys `inflight`, `gpu_inflight` (1 to 4,096 or 'auto'), `block`, `max_s`, `f
 = {"inflight": "auto", "gpu_inflight": "auto"}. Set, the first publish of a pool process checks that the worker
 build plays rolling jobs (`pool_worker`'s `info` lists the feature `rolling`; each alternate whose executable is the
 default's - the same sha256 in its signed manifest - is that executable, another one is checked when it is next to
-`pool_worker`'s build directory, else logged as unchecked) and refuses loudly otherwise; every self-play PUT carries
+`pool_worker`'s build directory - given its own runtime pack from there as `ZEROFARM_RUNTIME_DIR` for that call, which
+a torch worker's entry needs to answer at all (docs/az.md 81.1) -, else logged as unchecked, as is one whose pack is
+not here) and refuses loudly otherwise; every self-play PUT carries
 `rolling` (also PUT again on a resumed run whose setting changed: `put_extras`); and staleness is judged per row: a
 held game's rows searched with a network older than i - 1 - `pool_max_stale` are dropped (`stale_rows_dropped`), the
 rest of the game is kept, and the game is dropped (`stale_dropped`) only when none is left - a rolling lease lives
@@ -289,14 +291,24 @@ def rolling_setting(v):
     return out
 
 
-def worker_features(worker):
+# the variable a worker started from its runtime pack reads the pack's directory from (zero-farm PROTOCOL 19.4: the agent
+# sets it for every worker it starts; the torch worker build's entry, zf-pyshim.exe, finds its Python there and refuses
+# to answer anything - `info` too - without it)
+RUNTIME_DIR_ENV = 'ZEROFARM_RUNTIME_DIR'
+
+
+def worker_features(worker, runtime_dir=None):
     """The protocol features a worker executable announces (`<worker> info`'s `features`, zero-farm PROTOCOL 10.5;
-    absent: none) and its build id."""
+    absent: none) and its build id. `runtime_dir`: the worker's runtime pack on this machine, given to that one call as
+    the agent gives it (`RUNTIME_DIR_ENV`; docs/az.md 81.1)."""
     from .farm_h2h import worker_json
     if not worker or not os.path.isfile(worker):
         raise Refused(f'the worker executable {worker!r} is not on this machine', f'pool_worker must name the build\'s '
                                                                                  f'signed executable here ({FIX_BUILD})')
-    rc, info, text = worker_json(worker, 'info', '--ort-dll', 'none')
+    if runtime_dir:
+        rc, info, text = worker_json(worker, 'info', '--ort-dll', 'none', env={RUNTIME_DIR_ENV: runtime_dir})
+    else:
+        rc, info, text = worker_json(worker, 'info', '--ort-dll', 'none')
     if rc != 0 or not isinstance(info, dict):
         raise Refused(f'{worker} info: {text.strip()[-500:]}', f'pool_worker must be a working worker executable '
                                                                 f'({FIX_BUILD})')
@@ -844,7 +856,24 @@ class Pool:
                     continue
                 exe = os.path.join(here, b, m.get('entry') or '')
                 if m.get('entry') and os.path.isfile(exe) and FD.file_sha256(exe) == sha:
-                    feats, abid = worker_features(exe)
+                    # (an alternate's runtime pack is published next to the worker builds, under its build id: the
+                    # check gives it to the worker as the agent does, for this call only - a torch worker's entry runs
+                    # the pack's Python and answers nothing without it; docs/az.md 81.1)
+                    rt = m.get('requires_runtime')
+                    pack = os.path.join(here, rt) if rt and FD.BUILD_RE.match(str(rt)) else None
+                    there = bool(pack) and os.path.isdir(pack)
+                    try:
+                        feats, abid = worker_features(exe, pack) if there else worker_features(exe)
+                    except Refused as e:
+                        if RUNTIME_DIR_ENV not in e.reason:
+                            raise
+                        # (the worker's own answer names the variable: it runs from a pack that is not here, or not
+                        # whole - nothing this machine can check, as for an executable that is not here; never the
+                        # pool's end)
+                        self.log(f"pool_rolling: alternate {b}'s executable runs from its runtime pack {rt}, which is "
+                                 f"not {'whole ' if there else ''}on this machine (looked for {pack}): its rolling "
+                                 f"support is unchecked (a worker without it plays its rolling leases as classic ones)")
+                        continue
                     if abid != b or FD.FEATURE_ROLLING not in feats:
                         raise Refused(f'pool_rolling is set but alternate {b} ({exe}) announces features {feats}, '
                                       f'not {FD.FEATURE_ROLLING!r}', f'leave alternate {b} out of pool_alternates, or {unset}')

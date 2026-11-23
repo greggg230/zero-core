@@ -366,11 +366,12 @@ def coordinator_seed(run):
     return h
 
 
-def worker_json(worker, *args):
-    """`<worker> args...` -> (exit status, its JSON output or None, its output text)."""
+def worker_json(worker, *args, env=None):
+    """`<worker> args...` -> (exit status, its JSON output or None, its output text). `env`: variables added to this
+    process's for that one call (a worker run from its runtime pack: `ZEROFARM_RUNTIME_DIR`, docs/az.md 81.1)."""
     import subprocess
     p = subprocess.run(FD.exe_argv(worker, *args), capture_output=True, text=True, encoding='utf-8', errors='replace',
-                       timeout=600)
+                       timeout=600, env=dict(os.environ, **env) if env else None)
     try:
         out = json.loads(p.stdout)
     except ValueError:
