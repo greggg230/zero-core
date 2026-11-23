@@ -10361,3 +10361,130 @@ differs in the last bits (bf16 autocast's kernels choose differently between pro
 same game ids and seeds. So the plumbing is exact (fp32 proves it on the very GPU path); at bf16 the games are the
 trainer's in distribution, not bit for bit - as two trainer processes' own bf16 games would be.
 
+
+## 81. The torch worker's first live lease: the pool's check of a torch alternate, a finished game's rows, one CUDA graph capture at a time (no setting; zero-farm's torch runtime, 2026-11-23)
+
+Three problems of the first live run played through the farm by the torch worker of section 80 (MTG Zero best-of-three
+games at 64 simulations, a PC with an RTX 5090, rolling leases). None adds a setting.
+
+### 81.1 The pool's rolling check runs a torch alternate from its runtime pack
+
+**Why.** With `pool_rolling` set, the pool's first publish checks that each alternate build whose executable is on this
+machine announces the feature `rolling` (`<exe> info`, section 54). A torch alternate's executable is zero-farm's
+zf-pyshim.exe (PROTOCOL 19.4): it runs the worker with the Python of the torch runtime pack, whose directory the agent
+gives it in `ZEROFARM_RUNTIME_DIR` - and without that variable it answers nothing ("zf-pyshim: ZEROFARM_RUNTIME_DIR is
+not set", exit 3). The pool took that for the alternate's own answer, a definitive refusal (section 70): it stopped,
+and the run went on without the farm (a test run lost its farm that way; the workaround was the variable in the run's
+environment).
+
+**What.** `farm_pool.Pool._check_rolling`: an alternate's manifest names its pack (`requires_runtime`), and a release
+publishes packs next to the worker builds, each under its build id. When that directory is there the check gives it to
+the alternate for that one call (`worker_features(exe, runtime_dir)`: `ZEROFARM_RUNTIME_DIR` in the child's
+environment only, as the agent sets it for every worker with a runtime; `farm_h2h.worker_json(..., env=)`). When the
+worker's answer names the variable - the pack is not on this machine, or not whole - the alternate is logged as
+unchecked, exactly as one whose executable is not here ("a worker without it plays its rolling leases as classic
+ones"), and the pool goes on. A torch worker that answers without `rolling`, or fails for any other reason, is refused
+as before. The default build's check (`pool_worker`) is unchanged.
+
+**A change for native alternates**: an alternate with a pack that is here (the CUDA and DirectML alternates) is now
+also asked with the variable set, as on a farm PC. Its `info --ort-dll none` loads nothing from the pack.
+
+**Tests.** tests/test_farm_pool.py `test_rolling_check_runs_a_torch_alternate_from_its_runtime_pack` (a stand-in for the
+shim: the pack here - checked, the variable never in this process's environment; not here or without its Python -
+unchecked, the pool goes on; a torch worker without `rolling` or failing on its own - Refused). Checked by hand against
+a published MTG Zero torch build and its pack: without the variable exit 3, with it `features: ["rolling"]`.
+
+### 81.2 The worker's memory per game: the driver's own state, and a finished game's rows no longer made
+
+**Seen.** The agent measured the worker's commit charge growing over the first minutes of a lease to ~9 to 11 MB per game
+in flight (16.3 GB at 1,536 games), then a higher ratio once the games in flight were cut (the charge did not come
+back), and later a steady 8.3 MB per game.
+
+**Measured** (2026-11-23; MTG Zero's best-of-three job of that lease - its template's settings - on the published torch
+build's Python, the CPU only, the uniform evaluator, the driver built and driven as the worker's, `take_game_records`
+after every batch, the process's private bytes sampled every 10 ms; 4 search threads beside a live run).
+
+| | 64 games in flight, rows made (before) | 64 games, no rows (after) |
+|---|---|---|
+| private bytes over the start, steady | 8 to 15 MB a game (0.50 to 0.97 GB) | 7.8 to 8.7 MB a game (0.50 to 0.56 GB) |
+| peak private bytes over the start | 1.24 GB | 0.58 GB |
+| `take_game_records` per finished game | 65 ms, a rise of up to 268 MB | 0.4 ms, up to 8 MB |
+| finished games, rows a game | 81, 706 | 82, 704 |
+
+Two things, then:
+
+* **~8 MB per game in flight is the driver's own state** of a best-of-three MTG game at these settings, not the worker's:
+  it is there with no rows made, it grows as the games get longer (2.7 MB a game after 10 s, ~8 once games of every age
+  are in flight - a lease starts all its games at once, hence the minutes of growth), and it equals the agent's steady
+  8.3. Of it the evaluation cache is ~0.9 MB (192 games: 6.8 MB a game with `eval_cache` 8,192, 5.9 with 0, after
+  120 s, both still rising) and the held records ~1 MB (a row: ~250 non-zero features, ~21 auxiliary floats, 162 tail
+  floats - ~3 KB sparse, docs/search.md 2.21 - of ~700 rows by the game's end); the rest is the search's trees and the
+  game's state. The trainer's local self-play builds the same driver (`Run.driver`), so it holds the same per game;
+  nothing in this measurement says it holds less (the trainer process of that run committed 35 GB against the worker's
+  17.5 GB, with everything else a trainer holds). Lowering it is the driver's business (docs/search.md 2.21), for the
+  trainer and both workers alike.
+* **A finished game's rows were made for nothing** - the worker's own cost, and the peaks: when a game ended the driver
+  unpacked its rows dense (56,384 floats, 220 KB a row) and `take_game_records` copied them into one `[rows, features]`
+  array, of which the worker read `net` and nothing else (a record carries no row: the pool driver replays them). One
+  finished best-of-three of 312 to 1,121 rows was a 67 to 241 MB array plus the same again inside the driver, 25 to 116
+  ms on the thread that drives the search and launches the batches; the private bytes came back only in part between
+  takes. At 1,536 games several games end a second.
+
+**What.** `SearchDriver.set_sample_rows(False)` (docs/search.md 2.22), called by the worker beside `set_trace`: a
+finished game's rows are never made dense, `take_game_records` gives the same result rows and record texts and the
+samples' `net` alone. The records, and so the rows the pool driver replays, are unchanged.
+
+**Not a leak, and what else was looked at.** Nothing in `farm_torch_worker` grows with the lease: `RecordWriter` holds
+finished games' record texts (~31 KB a game here) until `shard_rows` rows or `flush_s`; `Progress.finished_gids` an int
+per game; `batch_ms` is capped; a rolling switch drops the old evaluator and its file's dict. The evaluation cache is
+per game and emptied with it. **Not measured**: the worker itself at 1,536 games on the GPU, before or after (no GPU
+was free: the table is the driver loop at 64 games on the CPU).
+
+**Tests.** tests/test_farm_torch_worker.py `test_the_worker_makes_no_sample_rows` (every samples dict the job takes holds
+`net` alone, the records whole), `test_a_driver_without_sample_rows_gives_the_same_records_and_no_rows`;
+`test_a_jobs_records_replay_to_the_trainers_rows` as before (the worker's records replay to the trainer's rows); the
+driver's tests in docs/search.md 2.22.
+
+**Video memory (not measured: no GPU was free; reasoned from the code).** The agent read 6.4 GB held with batches of 576
+rows, "10 MB per row"; the bench of section 80 held 4.0 GB for the whole machine at batches of 384. What the worker
+reports (`vram_mb`) is torch's *reserved* memory, a high-water mark until the cache is emptied (only at a switch or a
+yield), and it covers: (a) the playing evaluator's graphs - one per (rows padded to 64, tokens padded to 16, tail
+tokens and overrides padded to 16 * 2^k), each keeping its outputs, all in one pool whose size is the largest graph's
+activations (the attention's [rows, heads, tokens, tokens] products are the term that grows fastest) plus what the
+differing shapes fragment; a lease with half the trainer's groups has batches twice as long; (b) at every generation a
+*second* evaluator, built and self-tested (its own pool, the reference batches' graphs) while the first still plays -
+the trainer swaps weights in place (`set_weights`) and never holds two, nor captures its graphs again; (c) cuBLAS
+workspaces and the allocator's cache. A measurement on the GPU should read, in one worker over several generations:
+`torch.cuda.memory_allocated` beside `memory_reserved` (live against cached), `TokenGraphRunner.captures` and its keys,
+each before and after a checkpoint's build and after the switch's `empty_cache`, and one graph's own footprint at the
+largest key - then decide between coarser tail buckets (fewer keys), emptying the cache after a build, and building the
+next generation's evaluator by a weight swap into the playing one's graphs.
+
+### 81.3 One CUDA graph capture at a time
+
+**Seen.** The first torch lease died one second after it started: "switching to checkpoint 35" arrived while the job's
+first batches were being answered, and the job thread's capture of a new batch shape ended with
+`torch.AcceleratorError: CUDA error: operation failed due to a previous error during capture`
+(cudaErrorStreamCaptureInvalidated, from `torch/cuda/graphs.py` `capture_end` under `TokenGraphRunner._graph`). The
+log's lines of that second: the playing evaluator's "CUDA graphs on", the job's start, "checkpoint 35: building its
+evaluator while the games go on", the second evaluator's "CUDA graphs on", the traceback.
+
+**Cause** (read from the traceback, the timing and torch's source; not reproduced on a GPU). A rolling job builds and
+self-tests the next generation's evaluator on a thread of its own while the games go on (section 80). The self-test
+answers the reference batches, which captures that evaluator's first graphs - and one second into a lease the playing
+evaluator is still meeting new batch shapes, so the job thread captures too. Every `torch.cuda.graph` of a process
+captures on the same stream (torch's class-level `default_capture_stream`; torch 2.11's graphs.py), so two captures at
+once begin and end on one stream from two threads, and CUDA invalidates the capture.
+`capture_error_mode='thread_local'` (10.6) lets another thread's ordinary CUDA work run beside a capture - the trainer's
+case, training beside a lingering self-play - but not a second capture. Later switches were clean because by then the
+playing evaluator had captured its shapes: the window is a lease's first minutes (and the time after a switch, when
+the new evaluator meets the play's shapes, if the next generation's build starts at once).
+
+**What.** `infer.CAPTURE_MU`, a process-wide lock held around every capture (`GraphRunner._graph`,
+`TokenGraphRunner._graph`: the `torch.cuda.graph` block only; warm-ups, replays and eager work stay outside it). With
+one capturing thread - every run until the torch worker - nothing changes.
+
+**Tests.** tests/test_farm_torch_worker.py `test_cuda_graph_captures_never_overlap` (torch.cuda stood in for: two
+runners capturing three shapes each on two threads, never two captures at once; it fails without the lock). **To check
+on a GPU**: a rolling job sent a checkpoint within its first seconds, repeatedly (the race needs both threads
+capturing), with and without the lock.

@@ -70,6 +70,7 @@ Glass Road JS bot (~0.1 s per decision): 12.4 -> 3.75 min.
 import contextlib
 import copy
 import os
+import threading
 import time
 
 import numpy as np
@@ -83,6 +84,12 @@ ROW_STEP = 64                    # CUDA graphs are captured for batch sizes padd
 # (run setting selfplay_local_linger, docs/az.md 5.3) captures a new batch shape on its thread while the
 # run trains on another. One thread: the same as 'global'
 CAPTURE_MODE = 'thread_local'
+# One capture at a time in the process (docs/az.md 81.3): every `torch.cuda.graph` captures on torch's one capture
+# stream (its class-level `default_capture_stream`), so two threads capturing at once - two evaluators, e.g. the farm's
+# torch worker building a checkpoint's evaluator while the one in play meets a new batch shape - begin and end captures
+# on the same stream and CUDA invalidates them (cudaErrorStreamCaptureInvalidated at capture_end). Held for the capture
+# only: another thread's replays and eager work go on beside it, as 'thread_local' allows. One thread: no change
+CAPTURE_MU = threading.RLock()
 
 
 def segment_softmax_np(logits, off):
@@ -179,7 +186,8 @@ class GraphRunner:
                         self._run(x, n)
                 torch.cuda.current_stream().wait_stream(side)
                 graph = torch.cuda.CUDAGraph()
-                with torch.no_grad(), torch.cuda.graph(graph, pool=self.pool, capture_error_mode=CAPTURE_MODE):
+                with CAPTURE_MU, torch.no_grad(), torch.cuda.graph(graph, pool=self.pool,
+                                                                   capture_error_mode=CAPTURE_MODE):
                     out = self._run(x, n)
             g = self.graphs[Bp] = (graph, x, n, out)
         return g
@@ -749,7 +757,7 @@ class TokenGraphRunner:
                             self._run(x, n, full, ntok, tail, ov)
                     torch.cuda.current_stream().wait_stream(side)
                     graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph, pool=self.pool, capture_error_mode=CAPTURE_MODE):
+                    with CAPTURE_MU, torch.cuda.graph(graph, pool=self.pool, capture_error_mode=CAPTURE_MODE):
                         out, aux = self._run(x, n, full, ntok, tail, ov)
             g = self.graphs[key] = (graph, x, reg, o, out, aux)
             self.captures += 1

@@ -4580,11 +4580,21 @@ fn clear_queue_starts_no_new_game() {
 /// networks 0, 0, 1 (a new search epoch: games in flight cross networks), answered by `answer_lead` (decisive
 /// values: resignations fire). -> every (result row, its samples) in the order the driver gave them.
 fn traced_games(seat: SeatCfg, trace: bool, quota: u64) -> Vec<(GameResult, Vec<Record>)> {
+    traced_games_rows(seat, trace, quota, true)
+}
+
+/// `traced_games` with the samples' rows on or off (`Driver::set_sample_rows`, docs/search.md 2.22).
+fn traced_games_rows(seat: SeatCfg, trace: bool, quota: u64, rows: bool) -> Vec<(GameResult, Vec<Record>)> {
     let mut c = cfg(vec![seat], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
     (c.rolling, c.concurrency, c.groups, c.threads, c.aux) = (true, 10, 2, 3, true);
     let mut d = Driver::<ToyGame>::new(c).unwrap();
     if trace {
         d.set_trace(true).unwrap();
+    }
+    if !rows {
+        assert!(d.sample_rows());
+        d.set_sample_rows(false).unwrap();
+        assert!(!d.sample_rows());
     }
     let mut out = Vec::new();
     let take = |d: &mut Driver<ToyGame>, out: &mut Vec<(GameResult, Vec<Record>)>| {
@@ -4633,6 +4643,46 @@ fn same_row(a: &Record, b: &Record) -> Result<(), String> {
     chk("net", a.net == b.net)?;
     chk("aux", bits(&a.aux) == bits(&b.aux))?;
     chk("step", a.step == b.step)
+}
+
+/// Two runs of the same driver, game by game: the same result rows' facts and the same records (`game_json`'s
+/// text), `b`'s samples the rows-off form of `a`'s - no `x`, no `aux`, every other field `a`'s.
+fn same_games_without_rows(a: &[(GameResult, Vec<Record>)], b: &[(GameResult, Vec<Record>)]) -> (usize, usize) {
+    let by_gid = |v: &[(GameResult, Vec<Record>)]| v.iter().map(|(r, s)| (r.gid, (r.clone(), s.clone()))).collect::<std::collections::BTreeMap<_, _>>();
+    let (a, b) = (by_gid(a), by_gid(b));
+    assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>());
+    let (mut rows, mut dense) = (0, 0);
+    for (gid, (ra, sa)) in &a {
+        let (rb, sb) = &b[gid];
+        assert_eq!((ra.over, ra.aborted, ra.steps, ra.decisions, ra.rounds, ra.samples), (rb.over, rb.aborted, rb.steps, rb.decisions, rb.rounds, rb.samples), "game {gid}");
+        assert_eq!(crate::record::game_json(ra, sa).unwrap().to_string(), crate::record::game_json(rb, sb).unwrap().to_string(), "game {gid}: its record");
+        assert_eq!(sa.len(), sb.len());
+        for (x, y) in sa.iter().zip(sb) {
+            assert!(y.x.is_empty() && y.aux.is_empty(), "game {gid}: a sample with its row");
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            assert_eq!((x.player, x.n_players, &x.opts, bits(&x.pi), bits(&x.z), bits(&x.q), bits(&x.sc), x.net, x.step), (y.player, y.n_players, &y.opts, bits(&y.pi), bits(&y.z), bits(&y.q), bits(&y.sc), y.net, y.step), "game {gid}");
+            dense += x.x.len() + x.aux.len();
+        }
+        rows += sa.len();
+    }
+    (rows, dense)
+}
+
+#[test]
+fn samples_without_rows_give_the_same_games_and_records() {
+    // `Driver::set_sample_rows(false)` (docs/search.md 2.22; the farm's torch worker, zero-core docs/az.md 81.2): the
+    // games, their result rows and their records are the driver's with rows, bit for bit; only the samples' dense
+    // rows (`x`, `aux`) are never made. On by default; refused once games have started.
+    let with = traced_games_rows(record_seat(), true, 30, true);
+    let without = traced_games_rows(record_seat(), true, 30, false);
+    let (rows, dense) = same_games_without_rows(&with, &without);
+    assert!(with.len() >= 90 && rows > 0 && dense > 0, "{} games, {rows} rows, {dense} dense floats", with.len());
+    let mut c = cfg(vec![record_seat()], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    (c.rolling, c.concurrency) = (true, 2);
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    d.resume(1, 0).unwrap();
+    assert!(d.set_sample_rows(false).unwrap_err().contains("before the first resume"));
+    assert!(d.sample_rows());
 }
 
 #[test]

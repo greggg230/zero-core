@@ -935,6 +935,10 @@ pub trait DynDriver: Send + Sync {
     fn set_first_gid(&mut self, gid: u32) -> Result<(), String>;
     /// Trace every game (`Driver::set_trace`, docs/search.md 2.17).
     fn set_trace(&mut self, on: bool) -> Result<(), String>;
+    /// Samples without their rows (`Driver::set_sample_rows`, docs/search.md 2.22).
+    fn set_sample_rows(&mut self, on: bool) -> Result<(), String>;
+    /// `Driver::sample_rows`.
+    fn sample_rows(&self) -> bool;
     /// `Driver::set_game_log` (docs/search.md 2.20).
     fn set_game_log(&mut self, on: bool) -> Result<(), String>;
     /// Rolling mode, between phases: the games started from now on play `spec` (`Driver::set_spec`).
@@ -987,6 +991,12 @@ impl<G: SearchGame> DynDriver for Driver<G> {
     }
     fn set_trace(&mut self, on: bool) -> Result<(), String> {
         Driver::set_trace(self, on)
+    }
+    fn set_sample_rows(&mut self, on: bool) -> Result<(), String> {
+        Driver::set_sample_rows(self, on)
+    }
+    fn sample_rows(&self) -> bool {
+        Driver::sample_rows(self)
     }
     fn set_game_log(&mut self, on: bool) -> Result<(), String> {
         Driver::set_game_log(self, on)

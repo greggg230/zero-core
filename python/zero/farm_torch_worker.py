@@ -20,7 +20,8 @@ by `infer._drive_pipelined`'s loop (up to ZERO_INFLIGHT batches launched, submit
 (`SearchDriver.set_trace`, `take_game_records`: zero_search::record::game_json, the text the native worker writes)
 into gzip'd JSON-lines files of the native worker's format (`RecordWriter`: header, one line per game, files cut at
 `shard_rows` rows, records/2 with branched games), so the pool driver replays them unchanged; each row keeps the
-network that searched it (`net`).
+network that searched it (`net`). The driver's samples carry no rows (`SearchDriver.set_sample_rows(False)`,
+docs/az.md 81.2, docs/search.md 2.22): a record holds none, and nothing here reads one.
 
 **aw/1.** `hello` first, before torch is imported (aw 1, build_id = sha256(manifest.json next to worker_main.py)[:24],
 game, kinds ['selfplay'], zero_onnx [], models ['torch-weights/1'], features ['rolling'], pid); a `job` (kind
@@ -817,6 +818,10 @@ class Job:
         if self.gid_base:
             self.drv.set_first_gid(self.gid_base)
         self.drv.set_trace(True)
+        # (a record carries no row - the pool driver replays them - and this worker reads only a sample's network:
+        # the driver makes no finished game's rows dense, docs/az.md 81.2. With them a finished MTG best-of-three was
+        # ~200 MB of rows made twice on this thread, to be thrown away)
+        self.drv.set_sample_rows(False)
         # (the evaluator before the driver's first batch; a yield that came while it loaded is answered by the gate)
         if self.uniform:
             self.ev = UniformEvaluator()

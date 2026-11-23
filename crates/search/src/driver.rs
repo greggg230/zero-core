@@ -1710,22 +1710,35 @@ impl Held {
         rec.aux = dense_of(self.aux_len, &self.aux_at, &self.aux_val);
         rec
     }
+    /// The record without its row: `x` and `aux` left empty (`Driver::set_sample_rows(false)`, docs/search.md 2.22).
+    pub(crate) fn bare(self) -> Record {
+        self.rec
+    }
+    /// `unpack` (`rows`) or `bare`.
+    pub(crate) fn out(self, rows: bool) -> Record {
+        if rows {
+            self.unpack()
+        } else {
+            self.bare()
+        }
+    }
 }
 
 /// What `worker::emit` hands a game's labelled records out as: dense `Record`s (the driver's samples) or still `Held`
 /// (a contest's finished episodes, handed out with the contest).
 pub(crate) trait FromHeld {
-    fn from_held(h: Held) -> Self;
+    /// `rows`: the dense row with it (`Driver::set_sample_rows`; a `Held` keeps its row either way).
+    fn from_held(h: Held, rows: bool) -> Self;
 }
 
 impl FromHeld for Record {
-    fn from_held(h: Held) -> Record {
-        h.unpack()
+    fn from_held(h: Held, rows: bool) -> Record {
+        h.out(rows)
     }
 }
 
 impl FromHeld for Held {
-    fn from_held(h: Held) -> Held {
+    fn from_held(h: Held, _rows: bool) -> Held {
         h
     }
 }
@@ -2330,6 +2343,8 @@ struct Shared<G: SearchGame> {
     net: AtomicU32,
     /// Games started from now on are traced (`Driver::set_trace`).
     trace: AtomicBool,
+    /// A finished game's samples come out with their rows (`Driver::set_sample_rows`; true unless turned off).
+    sample_rows: AtomicBool,
     /// Games finishing from now on carry their log (`Driver::set_game_log`, docs/search.md 2.20).
     game_log: AtomicBool,
     /// The JSON of `spec` (`DriverCfg::spec`, or the last `set_spec`'s): `GameFailure::spec`.
@@ -2742,6 +2757,7 @@ impl<G: SearchGame> Driver<G> {
             epoch: AtomicU32::new(0),
             net: AtomicU32::new(net),
             trace: AtomicBool::new(false),
+            sample_rows: AtomicBool::new(true),
             game_log: AtomicBool::new(false),
             spec_json: Mutex::new(Arc::new(spec_json)),
             failures: Mutex::new(Vec::new()),
@@ -2949,6 +2965,26 @@ impl<G: SearchGame> Driver<G> {
         }
         self.sh.trace.store(on, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Samples without their rows (docs/search.md 2.22): with `on` false, the samples of every game that finishes
+    /// come out (`take_samples`) with `x` and `aux` empty - everything else of a `Record` as before (its decider,
+    /// options, policy, z / q / sc, network, step, tail and overrides). For a driver whose samples only become game
+    /// records (`record::game_json` reads no row: the reader replays the rows from the record): a finished game's
+    /// rows are then never made dense (MTG Zero: 220 KB a row, ~200 MB a finished best-of-three). Before the first
+    /// resume. Nothing about the games, their results or their traces changes. Never called (or `true`): nothing
+    /// changes.
+    pub fn set_sample_rows(&mut self, on: bool) -> Result<(), String> {
+        if self.resumed {
+            return Err("set_sample_rows: before the first resume (games have started)".into());
+        }
+        self.sh.sample_rows.store(on, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Whether samples come out with their rows (`set_sample_rows`; true by default).
+    pub fn sample_rows(&self) -> bool {
+        self.sh.sample_rows.load(Ordering::SeqCst)
     }
 
     /// Log every game (docs/search.md 2.20, MTG Zero's game database): each game that finishes from now on carries
@@ -3189,7 +3225,7 @@ impl<G: SearchGame> Driver<G> {
         let records: Vec<Held> = p.records.into_iter().map(|r| Held::pack(r.unpark())).collect();
         let cfg = &self.sh.cfg;
         let mut samples = Vec::new();
-        let row = catch_unwind(AssertUnwindSafe(|| worker::emit(cfg.record, &p.game, true, done, records, p.rq, &mut samples)))
+        let row = catch_unwind(AssertUnwindSafe(|| worker::emit(cfg.record, self.sh.sample_rows.load(Ordering::Relaxed), &p.game, true, done, records, p.rq, &mut samples)))
             .map_err(|pn| format!("game {gid} (driver seed {seed}): its outcome after resolve panicked: {}", worker::panic_msg(pn)))?;
         self.results.push(row);
         self.samples.append(&mut samples);

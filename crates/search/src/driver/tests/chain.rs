@@ -381,6 +381,55 @@ fn next_episode_continues_the_match_or_ends_it() {
 }
 
 #[test]
+fn contests_without_sample_rows_give_the_same_records() {
+    // `Driver::set_sample_rows(false)` on chained contests (docs/search.md 2.22): a contest's samples - every
+    // episode's, handed out with the contest - come out without their rows, and its record is the one with them
+    let run = |rows: bool| {
+        let seat = with_resign(with_view(nn(0, 16, true), LeafView::Mover, 0.5, ViewTarget::NextQ), 0.45, 1, 0.2);
+        let mut c = match_cfg(seat, 1);
+        (c.rolling, c.concurrency, c.groups, c.threads, c.aux) = (true, 8, 2, 3, true);
+        let mut d = Driver::<ToyMatch>::new(c).unwrap();
+        d.set_trace(true).unwrap();
+        d.set_sample_rows(rows).unwrap();
+        let mut out = std::collections::BTreeMap::new();
+        let mut take = |d: &mut Driver<ToyMatch>| {
+            let rs = d.take_results();
+            let smp = d.take_samples();
+            let mut a = 0;
+            for r in rs {
+                let k = r.samples as usize;
+                let text = crate::record::game_json(&r, &smp[a..a + k]).unwrap().to_string();
+                let dense: usize = smp[a..a + k].iter().map(|s| s.x.len() + s.aux.len()).sum();
+                out.insert(r.gid, (text, r.episodes.len(), k, dense));
+                a += k;
+            }
+            assert_eq!(a, smp.len());
+        };
+        for net in [0u32, 0, 1] {
+            d.resume(12, net).unwrap();
+            while let Some(b) = d.next_batch(true).unwrap() {
+                answer_lead_match(&mut d, &b);
+                take(&mut d);
+            }
+            take(&mut d);
+        }
+        out
+    };
+    let (with, without) = (run(true), run(false));
+    assert_eq!(with.keys().collect::<Vec<_>>(), without.keys().collect::<Vec<_>>());
+    let (mut multi, mut rows) = (0, 0);
+    for (gid, (text, eps, k, dense)) in &with {
+        let (t2, e2, k2, d2) = &without[gid];
+        assert_eq!((text, eps, k), (t2, e2, k2), "contest {gid}");
+        assert!(*k == 0 || *dense > 0, "contest {gid}: rows with the default");
+        assert_eq!(*d2, 0, "contest {gid}: a sample with its row");
+        multi += (*eps > 1) as usize;
+        rows += k;
+    }
+    assert!(with.len() >= 36 && multi > 0 && rows > 0, "{} contests, {multi} of several games, {rows} rows", with.len());
+}
+
+#[test]
 fn traced_contests_replay_to_their_rows_bit_for_bit() {
     // a traced rolling driver of toy matches (docs/search.md 2.17): every contest's record - its episode boundaries,
     // each episode's outcome and setup, resignations conceding a game while the match goes on - replays into the

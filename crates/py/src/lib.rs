@@ -1070,6 +1070,15 @@ impl PySearchDriver {
         self.d.set_trace(on).map_err(verr)
     }
 
+    /// Samples without their rows (`Driver::set_sample_rows`, docs/search.md 2.22): with `on` False - before the
+    /// first resume - a finished game's rows are never made dense: `take_game_records` gives the same result rows
+    /// and records, and for the samples a dict of their `net` only; `take_samples` / `take_records` refuse (they
+    /// have no rows to give). The farm's torch worker (zero.farm_torch_worker, docs/az.md 81.2), which reads nothing
+    /// else of a sample: a game's rows are replayed from its record.
+    fn set_sample_rows(&mut self, on: bool) -> PyResult<()> {
+        self.d.set_sample_rows(on).map_err(verr)
+    }
+
     /// A rolling driver's first game id (`Driver::set_first_gid`): its games are `gid`, `gid + 1`, ... - before the
     /// first resume. The farm's torch worker (zero.farm_torch_worker, docs/az.md 80): a job's ids from its
     /// `gid_base`, as the native worker's driver numbers them.
@@ -1087,7 +1096,8 @@ impl PySearchDriver {
 
     /// A traced driver's finished games (docs/search.md 2.17): take_results and take_samples at one point, with each
     /// game's record (`zero_search::record::game_json`, JSON text; "" for a game dropped after a panic: no record,
-    /// docs/search.md 2.18) -> (rows, records, samples dict or None).
+    /// docs/search.md 2.18) -> (rows, records, samples dict or None). After `set_sample_rows(False)` the samples
+    /// dict holds `net` only (docs/search.md 2.22).
     fn take_game_records<'py>(&mut self, py: Python<'py>) -> PyResult<(Bound<'py, PyList>, Vec<String>, Option<PyObject>)> {
         let rows = self.d.take_results();
         let recs = self.d.take_samples();
@@ -1111,12 +1121,22 @@ impl PySearchDriver {
         if a != recs.len() {
             return Err(rerr(format!("{} samples left over after the finished games", recs.len() - a)));
         }
+        if !self.d.sample_rows() {
+            // (samples without rows, docs/search.md 2.22: no array of rows - their networks only)
+            if recs.is_empty() {
+                return Ok((out, texts, None));
+            }
+            let a = PyDict::new(py);
+            a.set_item("net", recs.iter().map(|r| r.net).collect::<Vec<u32>>().into_pyarray(py))?;
+            return Ok((out, texts, Some(a.into_any().unbind())));
+        }
         let s = samples_dict(py, recs, self.nfeat, self.rows)?;
         Ok((out, texts, s))
     }
 
     /// Training sample arrays (docs/search.md 2.4) or None.
     fn take_samples(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        self.need_rows("take_samples")?;
         samples_dict(py, self.d.take_samples(), self.nfeat, self.rows)
     }
 
@@ -1124,12 +1144,13 @@ impl PySearchDriver {
     /// without its conversion - the records move out (no copy), and `SampleRecords.arrays()` turns
     /// them into take_samples' arrays later, on any thread (zero/data.py ThreadedShardWriter: the
     /// thread that drives the search never pays the copy; docs/az.md 31).
-    fn take_records(&mut self) -> Option<PySampleRecords> {
+    fn take_records(&mut self) -> PyResult<Option<PySampleRecords>> {
+        self.need_rows("take_records")?;
         let recs = self.d.take_samples();
         if recs.is_empty() {
-            return None;
+            return Ok(None);
         }
-        Some(PySampleRecords::new(recs, self.nfeat, self.rows))
+        Ok(Some(PySampleRecords::new(recs, self.nfeat, self.rows)))
     }
 
     /// Throughput counters.
@@ -1564,6 +1585,14 @@ impl PySampleRecords {
 }
 
 impl PySearchDriver {
+    /// `what` gives the samples' rows: refused on a driver whose samples have none (`set_sample_rows(False)`).
+    fn need_rows(&self, what: &str) -> PyResult<()> {
+        if self.d.sample_rows() {
+            return Ok(());
+        }
+        Err(verr(format!("{what}: this driver's samples have no rows (set_sample_rows(False), docs/search.md 2.22): take_game_records gives their records")))
+    }
+
     fn to_py(&self, py: Python<'_>, r: Option<Batch>) -> PyResult<Option<PyObject>> {
         let Some(b) = r else { return Ok(None) };
         let (key, external) = self.d.keys()[b.key as usize].clone();

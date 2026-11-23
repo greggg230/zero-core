@@ -1885,7 +1885,7 @@ fn finish<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &mut Vec<G
     } else {
         None
     };
-    let mut row = emit(cfg.record, &g, over, done, records, rq, samples);
+    let mut row = emit(cfg.record, sh.sample_rows.load(Ordering::Relaxed), &g, over, done, records, rq, samples);
     // (its branch's row follows from this slot: a records writer keeps the two in one file, docs/search.md 2.17)
     row.branched = fork.as_ref().is_some_and(|f| f.point.is_some());
     results.push(row);
@@ -1933,7 +1933,7 @@ fn finish_episode<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &m
     if slot.trace.is_some() {
         slot.trace_setups.push(g.record_setup());
     }
-    let row = emit(cfg.record, &g, over, done, records, rq, &mut ch.samples);
+    let row = emit(cfg.record, true, &g, over, done, records, rq, &mut ch.samples);
     // (an aborted episode's margin is never asked: `SearchGame::aborted`)
     let margins: Vec<f32> = if over { (0..n).map(|i| g.margin(i)).collect() } else { vec![0.0; n] };
     ch.steps += row.steps;
@@ -2011,7 +2011,9 @@ fn finish_episode<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &m
                 log: game_log(sh, slot, &g, &ch.samples),
             };
             results.push(row);
-            samples.extend(std::mem::take(&mut ch.samples).into_iter().map(Held::unpack));
+            // (the contest's samples go out here: dense, or without their rows - `Driver::set_sample_rows`)
+            let rows = sh.sample_rows.load(Ordering::Relaxed);
+            samples.extend(std::mem::take(&mut ch.samples).into_iter().map(|h| h.out(rows)));
             slot.fork = None;
             slot.branch = None;
             slot.dev_left = 0;
@@ -2154,7 +2156,7 @@ fn game_log<G: SearchGame>(sh: &Shared<G>, slot: &Slot<G>, g: &G, records: &[Hel
 ///
 /// A merged near-tie branch (`Done::outcome`, docs/search.md 2.11.1): its row's result and scores and its records' z
 /// and sc are its game's.
-pub(super) fn emit<G: SearchGame, S: FromHeld>(record: bool, g: &G, over: bool, mut d: Done, records: Vec<Held>, rq: Vec<Option<[f64; MAX_SEATS]>>, samples: &mut Vec<S>) -> GameResult {
+pub(super) fn emit<G: SearchGame, S: FromHeld>(record: bool, rows: bool, g: &G, over: bool, mut d: Done, records: Vec<Held>, rq: Vec<Option<[f64; MAX_SEATS]>>, samples: &mut Vec<S>) -> GameResult {
     let n = d.n;
     let out = d.outcome.take();
     let res: [f32; MAX_SEATS] = match &out {
@@ -2205,7 +2207,7 @@ pub(super) fn emit<G: SearchGame, S: FromHeld>(record: bool, g: &G, over: bool, 
                 };
                 r.sc[j] = margins[s];
             }
-            samples.push(S::from_held(h));
+            samples.push(S::from_held(h, rows));
         }
     }
     row

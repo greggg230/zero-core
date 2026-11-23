@@ -1004,6 +1004,34 @@ rebuilt by `record::replay` equal to the samples). MTG Zero: its behaviour diges
 and the same self-play job with the worker before and after the change (24 games of the legacy settings, records and
 shards byte for byte).
 
+### 2.22 Samples without their rows (`Driver::set_sample_rows`; the farm's torch worker, 2026-11-23)
+
+**Why.** A game holds its records sparse (2.21), but when it ends its samples go out dense: `worker::emit` (a
+contest: its hand-out) unpacks every `Held` into a `Record` whose `x` is the whole row (MTG Zero: 56,384 floats, 220
+KB), and the Python binding's `take_game_records` then copies them into one `[rows, features]` array. A driver whose
+samples only become game records needs none of it: `record::game_json` reads a sample's step, decider, option count,
+policy, q and network - never its row (the reader replays the rows from the record). The farm's torch worker
+(zero-core docs/az.md 81.2) is such a driver: a finished MTG best-of-three was 300 to 1,100 rows, ~70 to ~240 MB
+dense, made twice on the thread that drives the search and thrown away.
+
+**What.** `Driver::set_sample_rows(false)` (before the first resume; `DynDriver`, the binding's
+`SearchDriver.set_sample_rows(False)`): the samples of every game that finishes come out with `x` and `aux` empty
+(`Held::bare` instead of `Held::unpack`, in `emit`, a contest's hand-out and `resolve`); everything else of a
+`Record` as before. In Python `take_game_records` then gives the same result rows and record texts, and for the
+samples a dict of their `net` only; `take_samples` and `take_records` raise ValueError (they have no rows to give).
+Recording is unchanged (a row is still encoded and packed at its decision: the row limit of 2.15 reads its tail), so
+are the games, their results, traces and logs.
+
+**Default.** Rows on: never called, nothing changes (`Shared::sample_rows` starts true and is read only where a
+`Held` becomes a `Record`).
+
+**Tests.** `samples_without_rows_give_the_same_games_and_records` (the traced toy games of
+`traced_games_replay_to_their_rows_bit_for_bit`, rows on and off: the same result rows, `game_json` text for text, the
+samples' other fields bit for bit, no `x` / `aux`; refused after the first resume),
+`chain::contests_without_sample_rows_give_the_same_records` (chained contests: every episode's samples); Python:
+tests/test_farm_torch_worker.py `test_a_driver_without_sample_rows_gives_the_same_records_and_no_rows`. The native
+worker (crates/worker job.rs) still takes dense samples for its records; it could ask for none the same way.
+
 ## 3. MCTS semantics (reference: `zero/mcts.py`)
 
 * **Node** = one decision as the search sees it: decider, legal options (fixed for the node),

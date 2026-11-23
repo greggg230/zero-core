@@ -303,3 +303,149 @@ def test_torch_weights_round_trip(tmp_path):
         TW.read(str(tmp_path / 'g.onnx'))
     with pytest.raises(TW.NotTorchWeights):
         TW.read(p)                        # (a checkpoint is not the variant: weights_only refuses it or its format)
+
+
+# ---------------------------------------------------------------- samples without rows (docs/az.md 81.2, search.md 2.22)
+def _traced(rows, n=12):
+    """`n` traced toy games of a rolling driver, the samples' rows on or off -> {gid: (record text, nets)}, the last
+    samples dict's keys."""
+    from zero.infer import UniformEvaluator, drive
+    seat = G.nn_seat('m', 8, selfplay=True, sims_fast=2, p_full=0.5, view_samples=0.5)
+    drv = G.Driver('toy', [[seat, seat]], concurrency=4, seed=SEED, record=True, threads=1, groups=1, rolling=True, aux=True)
+    drv.set_trace(True)
+    if not rows:
+        drv.set_sample_rows(False)
+    out, keys = {}, None
+    while len(out) < n:
+        drv.resume(n - len(out), 0)
+        drive(drv, {'m': UniformEvaluator()})
+        res, texts, s = drv.take_game_records()
+        keys, at = set(s), 0
+        for r, t in zip(res, texts):
+            k = int(r['samples'])
+            out[int(r['gid'])] = (t, [int(x) for x in s['net'][at:at + k]])
+            at += k
+        assert at == len(s['net'])
+    return out, keys, drv
+
+
+def test_a_driver_without_sample_rows_gives_the_same_records_and_no_rows():
+    """`SearchDriver.set_sample_rows(False)`: the games' records (and their samples' networks) are the driver's with
+    rows, text for text; `take_game_records`' samples are their `net` only - no array of rows is made -, and the calls
+    that give rows refuse. Off unless asked (the default driver's dict has its rows); refused once games started."""
+    a, ka, _ = _traced(True)
+    b, kb, drv = _traced(False)
+    assert a == b and len(a) >= 12 and any(n for _, n in a.values())
+    assert {'x', 'pi', 'z', 'net'} <= ka and kb == {'net'}
+    for take in (drv.take_samples, drv.take_records):
+        with pytest.raises(ValueError, match='no rows'):
+            take()
+    with pytest.raises(ValueError, match='before the first resume'):
+        drv.set_sample_rows(True)
+
+
+def test_the_worker_makes_no_sample_rows(tmp_path, monkeypatch):
+    """The torch worker's driver is asked for samples without rows (docs/az.md 81.2: a finished game's rows, dense, were
+    made twice on the driving thread only to be dropped - ~200 MB a finished MTG best-of-three): every samples dict it
+    takes holds `net` alone, and the job's records are whole (test_a_jobs_records_replay_to_the_trainers_rows)."""
+    from zero.run import Run
+    seen = []
+
+    class Spy:
+        def __init__(self, d):
+            self._d = d
+
+        def __getattr__(self, k):
+            return getattr(self._d, k)
+
+        def take_game_records(self):
+            rows, texts, s = self._d.take_game_records()
+            if s is not None:
+                seen.append(set(s))
+            return rows, texts, s
+    real = Run.driver
+    monkeypatch.setattr(Run, 'driver', lambda self, *a, **k: Spy(real(self, *a, **k)))
+    out, q, th, box = serve(tmp_path, monkeypatch, job_line(None, uniform=True))
+    th.join(300)
+    assert box.get('rc') == 0, out.ev[-3:]
+    assert sum(r['games'] for r in out.of('records')) == 8
+    assert seen and all(k == {'net'} for k in seen), seen
+
+
+# ---------------------------------------------------------------- one CUDA graph capture at a time (docs/az.md 81.3)
+def test_cuda_graph_captures_never_overlap(monkeypatch):
+    """Two evaluators capturing at once (the worker's checkpoint thread building the next evaluator while the one in
+    play meets a new batch shape) share torch's one capture stream: CUDA invalidated the capture and the lease died
+    (cudaErrorStreamCaptureInvalidated, docs/az.md 81.3). Every capture holds `infer.CAPTURE_MU`: with torch.cuda
+    stood in for (no GPU here), two runners' `_graph` on two threads never capture at the same time - while each one's
+    warm-up, which is not a capture, still runs beside the other's."""
+    import types
+    from zero import infer as I
+    state = {'in': 0, 'max': 0, 'n': 0, 'warm_beside': False, 'warm': 0}
+    mu = threading.Lock()
+
+    class FakeStream:
+        def wait_stream(self, other):
+            pass
+
+    class FakeCtx:
+        def __init__(self, capture):
+            self.capture = capture
+
+        def __enter__(self):
+            if self.capture:
+                with mu:
+                    state['in'] += 1
+                    state['n'] += 1
+                    state['max'] = max(state['max'], state['in'])
+            return self
+
+        def __exit__(self, *a):
+            if self.capture:
+                with mu:
+                    state['in'] -= 1
+            return False
+    fake = types.SimpleNamespace(
+        Stream=FakeStream, current_stream=lambda *a: FakeStream(), CUDAGraph=object,
+        stream=lambda s: FakeCtx(False), graph=lambda g, pool=None, capture_error_mode=None: FakeCtx(True),
+        graph_pool_handle=lambda: None)
+    monkeypatch.setattr(I.torch, 'cuda', fake)
+    both = threading.Barrier(2)
+
+    def runner():
+        r = I.TokenGraphRunner.__new__(I.TokenGraphRunner)
+        r.graphs, r.pool, r.inp, r.ibuf, r.xstate, r.captures = {}, None, None, None, {}, 0
+        r.F, r.dev, r.tf32, r.Wt = 8, 'cpu', False, 1
+        r.net = types.SimpleNamespace(tails=[], option_pointers=False)
+        calls = []
+
+        def run(x, n, full, ntok, tail=None, ov=None):
+            calls.append(1)
+            if len(calls) == 1:
+                both.wait(10)                    # (both threads are in their warm-ups at once)
+            with mu:
+                if len(calls) <= 2:
+                    state['warm'] += 1
+                    state['warm_beside'] |= state['in'] > 0
+            time.sleep(0.05)
+            return x, None
+        r._run = run
+        return r
+    rs = [runner(), runner()]
+    errs = []
+
+    def go(r):
+        try:
+            for shape in ((64, 16), (128, 16), (64, 32)):
+                assert r._graph(*shape) is r._graph(*shape)
+        except BaseException as e:  # noqa: BLE001 - shown by the test
+            errs.append(e)
+    ths = [threading.Thread(target=go, args=(r,)) for r in rs]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join(60)
+    assert not errs, errs
+    assert state['n'] == 6 and [r.captures for r in rs] == [3, 3]
+    assert state['max'] == 1, f'{state["max"]} captures at once'
+    assert isinstance(I.CAPTURE_MU, type(threading.RLock()))
