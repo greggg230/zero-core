@@ -976,8 +976,10 @@ def test_staleness_per_row_with_rolling(pool, rolling):
         assert (cur['games'], cur['stale_dropped'], cur['stale_rows_dropped']) == (2, 1, 2 + len(nets_b))
         assert cur['rows'] == na - 2 + nc
         assert cur['stale'] == {'1': na - 3, '0': 1 + nc}, cur['stale']
+        # (the held games built here carry no single-game count: uncounted, docs/az.md 82)
         assert cur['by_machine'] == {'m_a': {'games': 2, 'rows': na - 2 + nc, 'stale_games': 1,
-                                             'stale_rows': 2 + len(nets_b), 'lag': cur['stale']}}
+                                             'stale_rows': 2 + len(nets_b), 'lag': cur['stale'],
+                                             'single_games': 0, 'single_uncounted': 2}}
     else:
         assert (cur['games'], cur['stale_dropped'], cur['stale_rows_dropped']) == (1, 2, 0)
         assert cur['stale'] == {'0': nc}
@@ -1005,8 +1007,10 @@ def test_stale_rows_by_machine_in_metrics_and_log(pool):
         p.th.join(10)
     assert out['stale_rows_dropped'] == 1 + nb and out['stale_dropped'] == 1
     assert out['by_machine'] == {
-        'm_slow': {'games': 1, 'rows': na - 1, 'stale_games': 1, 'stale_rows': 1 + nb, 'lag': {'0': na - 1}},
-        'm_fast': {'games': 1, 'rows': nc, 'stale_games': 0, 'stale_rows': 0, 'lag': {'1': nc}}}
+        'm_slow': {'games': 1, 'rows': na - 1, 'stale_games': 1, 'stale_rows': 1 + nb, 'lag': {'0': na - 1},
+                   'single_games': 0, 'single_uncounted': 1},
+        'm_fast': {'games': 1, 'rows': nc, 'stale_games': 0, 'stale_rows': 0, 'lag': {'1': nc},
+                   'single_games': 0, 'single_uncounted': 1}}
     line = [x for x in R.lines if 'stale rows by machine' in x]
     assert len(line) == 1 and f'm_slow {1 + nb}/{na + nb} (' in line[0] and '1 games whole' in line[0], line
     assert 'm_fast' not in line[0]

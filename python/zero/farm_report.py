@@ -8,7 +8,8 @@ recorded and what the Mac's fuzz farm logged, and POSTs one report to `<url>/v1/
 
     {"reporter": "desktop", "t": <unix s>, "sources": [{"id", "name", "kind": "local" | "ssh" | "vast",
       "hardware", "online", "working_on": ["run:<id>", ...], "selfplay_games": {"1h", "24h"},
-      "eval_games": {"1h", "24h"}, "fuzz_seeds": {"1h", "24h"}, "busy_h_24h"[, "error"][, "fuzz_state"]}]}
+      "eval_games": {"1h", "24h"}, "fuzz_seeds": {"1h", "24h"}, "busy_h_24h"[, "error"][, "fuzz_state"],
+      "single_games": {"1h", "24h"}, "uncounted": {"1h", "24h"}}]}
 
 Read only: nothing under a run directory is written, the Mac is only read (one ssh command).
 
@@ -47,6 +48,14 @@ this machine's; remote: the evals.jsonl row, its `host`'s; a farm evaluation's r
 65): only the games its deadline played here (`eval_pool.local`), this machine's. They count at the row's `time`. Not counted:
 an extra yardstick that records no `games` (MTG Zero's real_decks records its 2 x n games as `n`),
 anchor calibration and the one-off reference match.
+
+**Single games** (docs/az.md 82; zero-farm PROTOCOL 22.3). `selfplay_games` and `eval_games` count game ids as the
+rows record them - a whole best-of-three match each when a run's contests are matches. `single_games` is the single
+games of the ids whose count the run recorded next to them (`selfplay.single_games` for this machine's self-play
+games, an `eval_*` record's `single_games`; a remote's record when it carries one), `uncounted` the ids without a
+recorded count: rows written before the count existed, a remote's games (its record carries none today), the Elo
+pools' matches, an extra evaluation's games, a farm evaluation's games played here. Nothing is estimated: the ids of
+`selfplay_games` + `eval_games` are either behind `single_games` or in `uncounted`.
 
 **Sources.** A remote's recorded name maps to a source through the config's `aliases` (an old row's
 host 'user@host' -> 'mac'); `local` and `gpu:N` (`local_names`: this machine's other GPU) are this
@@ -493,16 +502,28 @@ def timed_rows(path, stop_before):
 def eval_games(row):
     """The games a metrics / evals row records as evaluations: every top-level eval_* record's `games`
     and every extras.<name>.games."""
-    n = 0
+    return sum(n for n, _ in eval_parts(row))
+
+
+def eval_parts(row):
+    """`eval_games`' records one by one: [(games - ids -, their single games or None when the record has no
+    `single_games`)] (docs/az.md 82: an eval_* record may carry it; an extra evaluation's never does)."""
+    out = []
     for k, v in row.items():
         if k.startswith('eval_') and isinstance(v, dict):
-            n += _num(v.get('games')) or 0
+            out.append((_num(v.get('games')) or 0, single_of(v)))
     ex = row.get('extras')
     if isinstance(ex, dict):
         for v in ex.values():
             if isinstance(v, dict):
-                n += _num(v.get('games')) or 0
-    return n
+                out.append((_num(v.get('games')) or 0, None))
+    return out
+
+
+def single_of(rec):
+    """A record's `single_games` when it is a count that its `games` can hold (at least one game an id), else None."""
+    n, g = _num(rec.get('single_games')), _num(rec.get('games')) or 0
+    return n if n is not None and n == int(n) and n >= g > 0 else None
 
 
 def is_pool(name):
@@ -556,7 +577,9 @@ class Report:
 
     def _a(self, sid):
         return self.acc.setdefault(sid, {'selfplay': {w: 0 for w, _ in WINDOWS}, 'eval': {w: 0 for w, _ in WINDOWS},
-                                         'fuzz': {w: 0 for w, _ in WINDOWS}, 'busy': [], 'runs': set()})
+                                         'fuzz': {w: 0 for w, _ in WINDOWS}, 'busy': [], 'runs': set(),
+                                         'single': {w: 0 for w, _ in WINDOWS},
+                                         'uncounted': {w: 0 for w, _ in WINDOWS}})
 
     def source_of(self, name):
         name = self.cfg.get('aliases', {}).get(name, name)
@@ -571,7 +594,9 @@ class Report:
             return 'vast'
         return (self.cfg.get('sources', {}).get(sid) or {}).get('kind') or 'ssh'
 
-    def games(self, sid, kind, n, t, run_id):
+    def games(self, sid, kind, n, t, run_id, single=None):
+        """`n` ids of `kind` at `t`; `single`: their single games when the row recorded them (docs/az.md 82), else
+        None - the ids are then counted as `uncounted` (self-play and eval; fuzz seeds are neither)."""
         n = _num(n) or 0
         if n <= 0 or not (self.now - DAY < t <= self.now + FUTURE_S):
             return
@@ -579,6 +604,11 @@ class Report:
         for w, s in WINDOWS:
             if t > self.now - s:
                 a[kind][w] += n
+                if kind != 'fuzz':
+                    if single is None:
+                        a['uncounted'][w] += n
+                    else:
+                        a['single'][w] += single
         if run_id:
             a['runs'].add(run_id)
 
@@ -620,10 +650,10 @@ class Report:
             src = self.source_of(str(row.get('host') or 'remote'))
             secs = _num(row.get('seconds')) or 0.0
             self.busy(src, t - secs, t, run.id)
-            g = eval_games(row)
+            for g, sg in eval_parts(row):
+                self.games(src, 'eval', g, t, run.id, single=sg)
             if isinstance(row.get('eval_yard'), dict):
-                g += run.elo_games(part, row.get('iter'))
-            self.games(src, 'eval', g, t, run.id)
+                self.games(src, 'eval', run.elo_games(part, row.get('iter')), t, run.id)
         if n:
             self.stats.append((run.id, part, 'evals.jsonl', n, used, derived))
 
@@ -648,20 +678,20 @@ class Report:
             self.busy(local, start, t, run.id)
             sp = m.get('selfplay')
             if isinstance(sp, dict):
-                self.games(local, 'selfplay', sp.get('games'), sp_end, run.id)
+                self.games(local, 'selfplay', sp.get('games'), sp_end, run.id, single=single_of(sp))
                 for name, r in remote_records(sp):
                     src = self.source_of(name)
-                    self.games(src, 'selfplay', r.get('games'), sp_end, run.id)
+                    self.games(src, 'selfplay', r.get('games'), sp_end, run.id, single=single_of(r))
                     rs = _num(r.get('running_s'))
                     rs = _num(r.get('seconds')) if rs is None else rs
                     self.busy(src, sp_end - (rs or 0.0), sp_end, run.id)
                     lg = r.get('linger')
                     if isinstance(lg, dict) and _num(lg.get('seconds')):
                         self.busy(src, sp_end, sp_end + lg['seconds'], run.id)
-            g = eval_games(m)
+            for g, sg in eval_parts(m):
+                self.games(local, 'eval', g, t, run.id, single=sg)
             if isinstance(m.get('eval_yard'), dict):
-                g += run.elo_games(part, m.get('iter'))
-            self.games(local, 'eval', g, t, run.id)
+                self.games(local, 'eval', run.elo_games(part, m.get('iter')), t, run.id)
         if n:
             self.stats.append((run.id, part, 'metrics.jsonl', n, used, derived))
 
@@ -782,6 +812,10 @@ def build_report(cfg, roots, now, runner=None, fuzz=True):
         d['selfplay_games'] = {w: int(round(v)) for w, v in a['selfplay'].items()}
         d['eval_games'] = {w: int(round(v)) for w, v in a['eval'].items()}
         d['fuzz_seeds'] = {w: int(round(v)) for w, v in a['fuzz'].items()}
+        # (docs/az.md 82: of the self-play + eval ids above, the single games of those whose count was recorded, and
+        # the ids without one - keys a coordinator before zero-farm PROTOCOL rev 30 ignores)
+        d['single_games'] = {w: int(round(v)) for w, v in a['single'].items()}
+        d['uncounted'] = {w: int(round(v)) for w, v in a['uncounted'].items()}
         if fz and sid == fz.get('source') and probe is not None:
             d['online'] = probe['online']
             if probe.get('chunks') is None:

@@ -648,6 +648,7 @@ class FarmMatches:
             ans = self.client.call('GET', f'/v1/admin/run/{self.farm}/results?after={self.st.get("cursor", 0)}'
                                           f'&limit={PAGE}') or {}
             res = ans.get('results') or []
+            counts = {}                            # result id -> its credited ids' single games (docs/az.md 82)
             for r in res:
                 bt = by_name.get(r.get('batch'))
                 if r.get('kind') != 'eval' or bt is None or bt.get('status') != 'submitted' or bt.get('refused') or \
@@ -658,10 +659,13 @@ class FarmMatches:
                 parts = [(r['key'], r.get('sha256'), ids_of(r.get('ids')))]
                 parts += [(x['key'], None, ids_of(x.get('ids'))) for x in r.get('also') or []]
                 new = []
+                cred = []
                 machine = r.get('machine_id') or '?'
                 for k, sha, ids in parts:
                     for row in FE.read_rows(self._file(k, sha)):
                         g = int(row['gid'])
+                        if g in ids:
+                            cred.append(row)
                         if g in dup or g in have or g not in ids:
                             continue
                         why = self.check_row(bt, row)
@@ -675,6 +679,10 @@ class FarmMatches:
                         break
                 if bt.get('refused'):
                     continue
+                try:
+                    counts[r.get('id')] = FE.credited_single_games(self.cfg['game'], self._spec(bt), r, cred)
+                except Exception:                  # noqa: BLE001 - a count is exact or absent, never the pull's failure
+                    pass
                 self._append(bt, new)
                 bt['have'] = sorted(have)
                 if new:
@@ -685,7 +693,7 @@ class FarmMatches:
             if res:
                 self.st['cursor'] = ans.get('cursor', self.st.get('cursor', 0))
                 self.save()
-                self.client.call('POST', f'/v1/admin/run/{self.farm}/ack', body={'cursor': self.st['cursor']})
+                self.client.call('POST', f'/v1/admin/run/{self.farm}/ack', body=FE.ack_body(self.st['cursor'], counts))
             if len(res) < PAGE:
                 self.save()
                 return taken

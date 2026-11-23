@@ -79,6 +79,33 @@ def episode_rows(r, me):
     return [(e['result'][me], e['margins'][me], e['over']) for e in r.get('episodes') or ()]
 
 
+def single_games(game, spec, row, players=2):
+    """The single games of ONE game id (docs/az.md 82), exactly, from its result row or its record (`row`: a dict of
+    either) - or None when they are not known (never an estimate). A chained contest (docs/az.md 42; asked of the
+    engine: `chained`) lists its episodes, one per game it played: their number (a driver's row and a record carry
+    them, and a record's replay refuses a list that is not the contest's; a row without them - a farm eval row that
+    was not traced - is not known). Any other id: what the game package declares for the spec (`id_games`: 1 for a
+    plain game; None - not declared, or an episode that is a whole contest of a varying number of games)."""
+    eps = row.get('episodes')
+    if chained(game, spec, players):
+        return len(eps) if isinstance(eps, (list, tuple)) and eps else None
+    if eps is not None:
+        return None
+    return package.active().id_games_of(game, spec_json(spec))
+
+
+def single_games_sum(game, spec, rows, players=2):
+    """The single games of `rows` (one row or record a game id) -> their sum, or None when any is not known (or there
+    is no row): a count is exact or absent."""
+    total = 0
+    for r in rows:
+        n = single_games(game, spec, r, players)
+        if n is None:
+            return None
+        total += n
+    return total
+
+
 def summarize_games(rows):
     """Per-game numbers of a chained evaluation (docs/az.md 42) from `episode_rows`: {games, win, se, score, margin,
     draws, unfinished}; None without any (an evaluation of whole games)."""

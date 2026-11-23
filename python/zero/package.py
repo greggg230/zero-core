@@ -172,6 +172,14 @@ class GamePackage:
                     config.json as a dict (or None), 'config_path', 'source': the source's name}. It must be
                     exact and loud: an unknown key, a name the run does not have, or a row it cannot decide
                     raises (ValueError). Default none: a source's `select` must be {} (every row)
+    id_games        game -> the single games ONE game id of a spec that does not chain its episodes plays
+                    (docs/az.md 82): an integer >= 1, or fn(spec JSON) -> an integer or None, or 'module:attr'.
+                    A plain game is 1. None - also the default, for a game the package does not list - says "not
+                    known from an id": a spec whose one episode is a whole contest of a varying number of games
+                    (MTG Zero's best-of-three without `game_episodes`). Never consulted for a chained spec, whose
+                    rows and records list their episodes. Only counting reads it (`zero.games.single_games`: the
+                    metrics' `single_games`, the farm pool's ack); an unknown count is reported as not counted,
+                    never estimated
     """
 
     def __init__(self, name, title, root, engine=None, run_module=None, game='toy', specs=None,
@@ -180,7 +188,8 @@ class GamePackage:
                  grids=None, remotes=None, tokens=None, eval_specs=None, deferred=None, evals=None, aux=None,
                  replay_aux=None, readers=None, remote_eval_files=None, settings=None, selfplay_specs=None,
                  remote_eval_inputs=None, evals_every=None, companion=None, on_fork=None, engine_paths=None,
-                 setting_classes=None, h2h_backend=None, farm_build=None, game_aliases=None, row_selectors=None):
+                 setting_classes=None, h2h_backend=None, farm_build=None, game_aliases=None, row_selectors=None,
+                 id_games=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -234,6 +243,7 @@ class GamePackage:
                                  f'aliased name)')
             self.game_aliases[g] = {'layout': rev, 'before': before}
         self.row_selectors = dict(row_selectors or {})
+        self.id_games = dict(id_games or {})
         for k, c in self.setting_classes.items():
             if k not in self.settings:
                 raise ValueError(f'{name}: setting_classes names {k!r}, which is not one of the package\'s settings')
@@ -411,6 +421,19 @@ class GamePackage:
             f = self.eval_specs[game] = resolve(f)
         return f(spec)
 
+    def id_games_of(self, game, spec):
+        """The single games one id of `game` with the non-chained `spec` plays (`id_games`, docs/az.md 82): an
+        integer >= 1, or None when the package does not say (not counted)."""
+        f = self.id_games.get(game)
+        if isinstance(f, str):
+            f = self.id_games[game] = resolve(f)
+        n = f(spec) if callable(f) else f
+        if n is None:
+            return None
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            raise ValueError(f'{self.name}: id_games of {game!r} answered {n!r}: an integer >= 1 or None')
+        return n
+
     def spec_of(self, game):
         """The default spec of `game` ('' if none)."""
         return self.specs.get(game, '')
@@ -497,7 +520,8 @@ TOY_TAIL_WIDE_TOKENS = dict(TOY_TAIL_TOKENS, name="toy_tail_wide", max_row_token
 CORE = GamePackage('zero', 'Zero Core', CORE_ROOT, engine='zero._engine', run_module='zero.run', game='toy',
                     dashboard_port=None, hub_id=None, env_prefix='ZERO',
                     tokens={'toy': TOY_TOKENS, 'toy_tail': TOY_TAIL_TOKENS, 'toy_tail_wide': TOY_TAIL_WIDE_TOKENS},
-                    aux={'toy': TOY_AUX, 'toy_match': TOY_AUX}, readers={'toy': TOY_READERS})
+                    aux={'toy': TOY_AUX, 'toy_match': TOY_AUX}, readers={'toy': TOY_READERS},
+                    id_games={'toy': 1, 'toy_tail': 1, 'toy_tail_wide': 1, 'toy_match': 1})
 # (toy_match, the core's chained-episodes game, docs/az.md 42: the toy's features first, so the toy's target too)
 
 

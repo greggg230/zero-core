@@ -31,6 +31,13 @@ run process (`Pool`, owned by zero.remoteplay.RemotePlay) that
    net >= i - 1 - `pool_max_stale` (default 1); older ones are dropped (counted). Every accepted row goes into the
    iteration's staleness histogram as a remote's do.
 
+5. **single games** (docs/az.md 82; zero-farm PROTOCOL 22): a game id is one game, or - a spec whose contests are
+   matches - one whole match. The replay knows which: the ack carries, for every result whose credited ids were all
+   found and replayed and whose games are known (`zero.games.single_games`: a chained contest's episodes, else the
+   game package's `id_games`), the single games in those ids (`single_games` [[result id, n], ...]; no entry
+   otherwise - never an estimate), and the iteration's metrics carry the accepted games' (`single_games`,
+   `single_uncounted` = accepted ids without a known count, `single_machines`, and both per machine in `by_machine`).
+
 The run never waits for the pool: RemotePlay.end closes the pool's shards of the iteration with whatever it accepted.
 
 Settings (zero.run DEFAULTS, docs/az.md 45): `pool_build` (the worker build id, required), `pool_runtime` (its runtime
@@ -591,13 +598,14 @@ class Pool:
     def _counters(it):
         return {'it': it, 'games': 0, 'rows': 0, 'shards': 0, 'records': 0, 'chunks': 0, 'refused': 0,
                 'stale_dropped': 0, 'stale_rows_dropped': 0, 'machines': {}, 'stale': {}, 'replay_s': 0.0, 'forks': None,
-                'by_machine': {}}
+                'by_machine': {}, 'single_games': 0, 'single_uncounted': 0, 'single_machines': {}}
 
     def _mach(self, m):
         """(mu held) Machine `m`'s staleness counters in the open iteration (rolling only, docs/az.md 54.8)."""
         c = self.cur['by_machine'].get(m)
         if c is None:
-            c = self.cur['by_machine'][m] = {'games': 0, 'rows': 0, 'stale_games': 0, 'stale_rows': 0, 'lag': {}}
+            c = self.cur['by_machine'][m] = {'games': 0, 'rows': 0, 'stale_games': 0, 'stale_rows': 0, 'lag': {},
+                                             'single_games': 0, 'single_uncounted': 0}
         return c
 
     def live(self):
@@ -659,7 +667,11 @@ class Pool:
             out = {'farm_run': self.farm, 'games': cur['games'], 'samples': cur['rows'], 'shards': cur['shards'],
                    'records': cur['records'], 'chunks': cur['chunks'], 'refused': cur['refused'],
                    'stale_dropped': cur['stale_dropped'], 'held': len(self.held), 'machines': dict(cur['machines']),
-                   'replay_s': round(cur['replay_s'], 2), 'gen': self.st.get('current_gen'), 'stale': dict(cur['stale'])}
+                   'replay_s': round(cur['replay_s'], 2), 'gen': self.st.get('current_gen'), 'stale': dict(cur['stale']),
+                   # (docs/az.md 82: the accepted games' single games - `games` counts ids, a whole match each when the
+                   # spec's contests are matches -, the accepted ids whose single games are not known, and per machine)
+                   'single_games': cur['single_games'], 'single_uncounted': cur['single_uncounted'],
+                   'single_machines': dict(cur['single_machines'])}
             if self.rolling is not None:           # (per-row staleness; off: the metrics of before)
                 out['stale_rows_dropped'] = cur['stale_rows_dropped']
                 out['by_machine'] = {m: dict(c, lag=dict(c['lag'])) for m, c in cur['by_machine'].items()}
@@ -1040,10 +1052,11 @@ class Pool:
         q = f'/v1/admin/run/{self.farm}/results?limit={PAGE}' + (f'&after={self.st["cursor"]}' if self.st['cursor'] else '')
         ans = self.client.call('GET', q)
         res = ans.get('results') or []
+        counts = {}                                # result id -> its credited ids' single games (docs/az.md 82)
         for r in res:
             if r.get('kind') != 'selfplay':
                 continue
-            self._chunk(r)
+            counts[r.get('id')] = self._chunk(r)
         self._drain()
         gen = self.st['current_gen']
         with self.mu:
@@ -1053,7 +1066,10 @@ class Pool:
             self.client.call('POST', f'/v1/admin/run/{self.farm}/accept', body={'gen': gen, 'games': total})
             self.st['accept_sent'] = [gen, total]
         if res and ans.get('cursor') is not None:
-            self.client.call('POST', f'/v1/admin/run/{self.farm}/ack', body={'cursor': ans['cursor']})
+            # (with the single games of each result whose count is exact - zero-farm PROTOCOL 22, docs/az.md 82: a key
+            # a coordinator before it ignores; without any count, the body of before)
+            from .farm_eval import ack_body
+            self.client.call('POST', f'/v1/admin/run/{self.farm}/ack', body=ack_body(ans['cursor'], counts))
             self.st['cursor'] = ans['cursor']
         self._save()
         if len(res) >= PAGE:
@@ -1078,7 +1094,10 @@ class Pool:
         self.log(f'record REFUSED (machine {m}, {r.get("key")}{"" if gid is None else f", game {gid}"}): {why[:300]}')
 
     def _chunk(self, r):
-        """One self-play result chunk: its credited games replayed and held (module docstring)."""
+        """One self-play result chunk: its credited games replayed and held (module docstring) -> the single games in
+        the ids it credited (docs/az.md 82: exact - every credited id found and replayed, each one's games known - or
+        None: a refused record, an id missing from the file, a spec whose ids' games are not known)."""
+        from . import games as G
         from .data import _rows_shard, compact, compact_rows, compact_sparse, shard_format
         from .finite import shard_problems
         E = self._engine()
@@ -1130,6 +1149,7 @@ class Pool:
         except (ValueError, KeyError, TypeError):
             return self._refuse(r, 'a game line without its gid', body)
         parent = {}                                # gid -> its game's line (a branch replays with it: records/2)
+        single = {}                                # gid -> its single games (None: not known), credited games only
         for k, (ln, x, gid) in enumerate(zip(lines, recs, gids)):
             if not _in_ranges(gid, ids):
                 continue                           # (not credited to this chunk: another copy counts - with its branch)
@@ -1171,8 +1191,13 @@ class Pool:
                 if probs:
                     return self._refuse(r, f'game {gid}: non-finite rows: {"; ".join(probs)}', body, gid)
                 net = int(s['net'].min())
+            # (docs/az.md 82: the replayed record's single games - a chained contest's episodes, else what the package
+            # declares for the spec; a branch game is its game's second record, never another single game)
+            sg = 0 if br is not None else G.single_games(self.R.cfg['game'], rspec, x, g['n'])
+            if br is None:
+                single[gid] = sg
             item = {'gid': gid, 'machine': machine, 'net': net if net is not None else r.get('gen'), 's': s,
-                    'rows': g['rows'], 'replay_s': dt}
+                    'rows': g['rows'], 'replay_s': dt, 'sg': sg}
             if self.R.cfg.get('selfplay_branch'):
                 # branched games (zero/forks.py tally, docs/az.md 24 / 72): the game's origin as a result row has it
                 item['fk'] = {'samples': g['rows'], 'decisions': 0, 'branch': br, 'neartie': x.get('neartie')}
@@ -1185,6 +1210,9 @@ class Pool:
             self.cur['records'] += len(keep)
         if keep:
             self.t_game = time.time()
+        if len(single) != r.get('games') or any(n is None for n in single.values()):
+            return None
+        return sum(single.values())
 
     def _engine(self):
         from . import games as G
@@ -1259,6 +1287,18 @@ class Pool:
         self.cur['replay_s'] += g['replay_s']
         m = g['machine']
         self.cur['machines'][m] = self.cur['machines'].get(m, 0) + 1
+        sg = g.get('sg')                           # (docs/az.md 82: the id's single games; None: not known)
+        if sg is None:
+            self.cur['single_uncounted'] += 1
+        else:
+            self.cur['single_games'] += sg
+            self.cur['single_machines'][m] = self.cur['single_machines'].get(m, 0) + sg
+        if self.rolling is not None:
+            c = self._mach(m)
+            if sg is None:
+                c['single_uncounted'] += 1
+            else:
+                c['single_games'] += sg
         if g.get('fk') is not None:
             # (branched games: a branch counts as one of the iteration's games, as on this machine - docs/az.md 24)
             from .forks import new_tally, tally

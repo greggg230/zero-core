@@ -677,9 +677,11 @@ def pull(cl, d, st):
     while True:
         ans = cl.call('GET', f'/v1/admin/run/{run}/results?after={st.get("cursor", 0)}&limit=500')
         res = ans.get('results') or []
+        counts = {}                                # result id -> its credited ids' single games (docs/az.md 82)
         for r in res:
             if r.get('kind') != 'eval' or (r.get('batch') not in (None, st['batch'])):
                 continue
+            cred = []
             dup = rng(r.get('dup_ids'))
             parts = [(_file(cl, d, r['key'], r.get('sha256')), rng(r.get('ids')))]
             for x in r.get('also') or []:
@@ -688,10 +690,13 @@ def pull(cl, d, st):
             for text, ids in parts:
                 for row in read_rows(text):
                     g = row['gid']
+                    if g in ids:
+                        cred.append(row)
                     if g in dup or g in have or g not in ids:
                         continue
                     have.add(g)
                     new.append(row)
+            counts[r.get('id')] = _single_games(st, r, cred)
             if new:
                 with open(rows_path, 'a', encoding='utf-8', newline='\n') as f:
                     for row in new:
@@ -703,9 +708,20 @@ def pull(cl, d, st):
         if res:
             st['cursor'] = ans.get('cursor', st.get('cursor', 0))
             save_state(d, st)
-            cl.call('POST', f'/v1/admin/run/{run}/ack', body={'cursor': st['cursor']})
+            from .farm_eval import ack_body
+            cl.call('POST', f'/v1/admin/run/{run}/ack', body=ack_body(st['cursor'], counts))
         if len(res) < 500:
             return taken
+
+
+def _single_games(st, r, rows):
+    """A result entry's single games for the ack (docs/az.md 82; zero.farm_eval.credited_single_games), or None: not
+    counted - also when the game's engine is not importable here (whether the spec chains is asked of it)."""
+    from .farm_eval import credited_single_games
+    try:
+        return credited_single_games(st['game'], st['settings']['eval_spec'], r, rows)
+    except Exception:                              # noqa: BLE001 - a count is exact or absent, never the pull's failure
+        return None
 
 
 def rows_of(d):

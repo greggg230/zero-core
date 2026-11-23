@@ -207,6 +207,45 @@ def replay_trace(row, game, spec, engine, seed, paired=True, samples=False, aux=
     return info
 
 
+def credited_single_games(game, spec, r, rows):
+    """The single games in the ids a result entry `r` (zero-farm `GET .../results`) credited (docs/az.md 82; zero-farm
+    PROTOCOL 22) - exactly, or None (not counted). `rows`: the rows of its file and of its `also` files whose gid is
+    one of the ids it credited from each (whatever copy of a game the caller keeps). None unless every credited id
+    is there once (`r['games']` of them) and each one's games are known (`zero.games.single_games`: a traced row's
+    record - its digest checked - lists a chained contest's episodes; an untraced row of a chained contest does not
+    say; any other spec is what the game package declares, `id_games`)."""
+    from . import games as G
+    by = {}
+    for row in rows:
+        by[int(row['gid'])] = row
+    if not by or len(by) != r.get('games'):
+        return None
+    total = 0
+    for row in by.values():
+        src = row
+        if isinstance(row.get('rec'), dict):
+            try:
+                check_digest(row)
+            except TraceMismatch:
+                return None
+            src = row['rec']
+        n = G.single_games(game, spec, src)
+        if n is None:
+            return None
+        total += n
+    return total
+
+
+def ack_body(cursor, counts):
+    """The body of `POST .../ack` (zero-farm PROTOCOL 22): the cursor and, when any result's single games are known,
+    `single_games` [[result id, n], ...] (`counts`: {result id: n}); without any, the body of before."""
+    body = {'cursor': cursor}
+    pairs = sorted([int(k), int(v)] for k, v in counts.items() if k is not None and v is not None)
+    if pairs:
+        body['single_games'] = pairs
+    return body
+
+
 def row_json(d):
     return json.dumps(d, separators=SEP)
 

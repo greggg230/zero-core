@@ -10488,3 +10488,69 @@ one capturing thread - every run until the torch worker - nothing changes.
 runners capturing three shapes each on two threads, never two captures at once; it fails without the lock). **To check
 on a GPU**: a rolling job sent a checkpoint within its first seconds, repeatedly (the race needs both threads
 capturing), with and without the lock.
+
+## 82. Single games: what one game id holds, counted exactly or not at all (no setting; the package hook `id_games`; zero-farm PROTOCOL 22, 2026-11-23)
+
+**Why.** Every count of "games" in a run and on the farm counts game ids: `selfplay.games`, a pool's `games`, an
+evaluation's `games`, the coordinator's `results.games`. An id is whatever the spec plays under it - one game, or one
+whole contest: MTG Zero's best-of-three match (section 42) is two or three games an id. The farm's status board added
+both kinds together as "games". Throughput is reported in single games; only the trainer side knows how many an id
+held, and it knows exactly.
+
+**The rule** (`zero.games.single_games(game, spec, row)`; `single_games_sum` over rows). The single games of one id,
+from its driver row or its record:
+
+* a spec that chains its episodes (`chained`, section 42): the number of episodes the row or the record lists - one
+  per game the contest played, an unfinished last game included (the count `selfplay.episodes.games` always was). A
+  record's replay refuses a list that is not the contest's (docs/search.md 2.17), so a replayed record's count is
+  checked. A row without the list (a farm eval row that was not traced) is **not known**.
+* any other spec: what the game package declares, `GamePackage(id_games={game: 1 | fn(spec) -> int | None})`. A
+  plain game declares 1. None - also every game a package does not list - is **not known**: a spec whose one episode
+  is a whole contest of a varying number of games (MTG Zero's `"format": "bo3"` without `game_episodes`) cannot be
+  counted from an id, and a package that has not said is not guessed at. The core's toys declare 1.
+
+A count is exact or absent. Nothing here estimates, and no reader multiplies ids by a ratio.
+
+**Where it goes.**
+
+* **The farm pool** (`zero.farm_pool`, section 45). `_chunk` replays every credited game anyway; a result whose
+  credited ids were all found (`games` of them, a branch game's second record never another game) and all counted
+  gets an entry in the ack: `POST .../ack {"cursor", "single_games": [[result id, n], ...]}` (zero-farm PROTOCOL
+  22.1; `zero.farm_eval.ack_body`). A refused record, an id missing from the file or an unknown count: no entry - the
+  coordinator keeps NULL for it. A coordinator before PROTOCOL rev 30 ignores the key; without any count the body is
+  the one of before. The iteration's metrics (`selfplay.pools.<name>`) gain `single_games` (the accepted games'),
+  `single_uncounted` (accepted ids without a count) and `single_machines` ({machine: single games}); `by_machine`
+  (rolling leases, 54.8) gains `single_games` and `single_uncounted` per machine. `games`, `machines` and every other
+  field keep their meaning (ids). The ack counts what a result credited, the metrics what the quota accepted (a held
+  game counts in the iteration that takes it, a stale one never).
+* **Farm evaluations** (`zero.farm_h2h.pull`, `zero.eval_pool.EvalPool.pull`): the same key in their acks, from
+  `zero.farm_eval.credited_single_games` - the rows of the ids a result credited (its own and the held ids of earlier
+  files it completed), each id once. A spec that does not chain: the package's number. A chained spec: only a traced
+  row (`eval_trace`, its digest checked) says, through its record's episodes; an untraced row of a chained contest is
+  **not counted** - the worker's eval row does not carry the games of its match (`zero.eval_pool` refuses chained
+  evaluation specs anyway). Counting those would need a row field from the worker (a new worker build); not done.
+* **A run's own rows** (`Run.single_game_metrics`, `Run.eval_single_games`): `selfplay.single_games` for this
+  machine's `selfplay.games` (left out unless every row is counted, and counted the same under the spec of the
+  last iteration this process counted - a rolling driver's rows may have started under it; the package's `selfplay_specs` hook is never asked again), and `single_games` in `eval_yard` /
+  `eval_random` (a chained evaluation: the games `per_game` counts). Not recorded: a remote host's self-play (its
+  shard events carry `games` only), the Elo pools' matches, an extra evaluation's games.
+* **`zero.farm_report`** (44.3): each source gains `single_games` {"1h", "24h"} - the single games of the ids whose
+  row recorded a count - and `uncounted` - the self-play and eval ids without one (older rows, and the three kinds
+  above). `selfplay_games` / `eval_games` are unchanged (ids).
+
+**Not a setting, and what changes without one.** Nothing about play, search or training: no game is played or
+labelled differently (the golden digests do not see it). Deliberate, visible changes: new keys in metrics rows and in
+the pool's metrics, a new key in three ack bodies and two in the report's sources. A problem while counting a run's
+own rows is logged and the key left out.
+
+**For a game package.** Declare `id_games` for every game whose plain (non-chained) specs are one game an id; return
+None from the function for a spec that packs several games into one episode. Until a package declares it, its
+non-chained ids are reported as not counted - by design: a missing declaration never turns matches into games.
+
+**Costs.** One `len` per replayed game; `chained` builds one game object per (game, spec) and caches it.
+
+**Tests.** tests/test_single_games.py (8): the rule (episodes, the package's number, not known); the pool's ack
+entries and metrics for plain games (a refused record and a result with a missing id get no entry), for the chained
+toy match with classic and rolling leases, and for a spec the package cannot count (the ack of before); a farm
+evaluation's count (untraced, traced, a wrong digest, a missing id); the report's split; a toy and a toy_match run's
+rows end to end. **Measured**: nothing on a live run yet - the farm side needs the coordinator of PROTOCOL rev 30.

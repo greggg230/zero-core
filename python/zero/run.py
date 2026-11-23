@@ -1020,6 +1020,7 @@ class Run:
         self.tail_metrics(it, out, st, st0, results)
         self.failure_metrics(it, out, results, drv)
         self.episode_metrics(it, out, results)
+        self.single_game_metrics(it, out, results, spec)
         self.timing_metrics(out, st, st0, ev, secs)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         if lg is not None:
@@ -1282,6 +1283,43 @@ class Run:
                  f"({out['episodes']['per_contest']} each), {out['episodes']['draws']} drawn, "
                  f"{out['episodes']['resigned']} resigned, {out['episodes']['unfinished']} unfinished")
 
+    def single_game_metrics(self, it, out, results, spec):
+        """`single_games` (docs/az.md 82): the single games of this machine's `games` (ids: a whole match each when the
+        spec's contests are matches) - a chained contest's episodes, else what the game package declares for the spec
+        (`id_games`). Written only when it is exact: every row's games known, and the same under the spec this
+        process counted its last iteration with (a rolling driver's rows may have started under it: `selfplay_specs`,
+        docs/az.md 40 - remembered here, the package's hook is never asked again). A count that is not known is left
+        out - whoever reads the row reports those games as not counted. Never the run's failure: a problem is logged
+        and the key left out."""
+        try:
+            c = self.cfg
+            specs = {G.spec_json(spec)}
+            prev, self._single_spec = getattr(self, '_single_spec', None), G.spec_json(spec)
+            if prev is not None:
+                specs.add(prev)
+            got = {G.single_games_sum(c['game'], s, results, (c.get('players') or [2])[0]) for s in specs}
+            if len(got) == 1 and None not in got:
+                out['single_games'] = got.pop()
+        except Exception as e:                     # noqa: BLE001 - counting only
+            self.log(f'iter {it} single games not counted: {type(e).__name__}: {str(e)[:200]}')
+
+    def eval_single_games(self, rec, pg):
+        """An evaluation record's `single_games` (docs/az.md 82): its `games` are contests when the evaluation spec
+        chains (their games are `pg`, docs/az.md 42), else ids of what the package declares (`id_games`); left out
+        when not known."""
+        try:
+            c = self.cfg
+            if self.eval_chained():
+                n = len(pg) if pg else None
+            else:
+                spec = c.get('eval_spec') or package.active().eval_spec_of(c['game'], c['spec'])
+                k = package.active().id_games_of(c['game'], G.spec_json(spec))
+                n = None if k is None else k * rec['games']
+            if n is not None and rec.get('games'):
+                rec['single_games'] = n
+        except Exception as e:                     # noqa: BLE001 - counting only
+            self.log(f'evaluation single games not counted: {type(e).__name__}: {str(e)[:200]}')
+
     def selfplay_shared(self, it):
         """Iteration `it`'s self-play with a remote (docs/az.md 5.3; zero/remoteplay.py,
         zero/workqueue.py): `games` finished games in total, this machine's and the remote's, every
@@ -1450,6 +1488,7 @@ class Run:
         self.tail_metrics(it, out, st, st0, results)   # (this machine's driver; every source's aborted games)
         self.failure_metrics(it, out, results, drv)
         self.episode_metrics(it, out, results)
+        self.single_game_metrics(it, out, results, spec)
         self.timing_metrics(out, st, st0, ev, secs)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         out['rolling'] = {'in_flight': drv.in_flight()['games'], 'restarts': st['restarts'] - st0['restarts'],
@@ -2126,6 +2165,7 @@ class Run:
         if pg:
             # a chained game's contests (docs/az.md 42): the rows above are matches, these its games
             m['eval_yard']['per_game'] = G.summarize_games(pg)
+        self.eval_single_games(m['eval_yard'], pg)
         if tag != 'visits':
             m['eval_yard']['select'] = tag
         self.log(f'iter {it} vs {self.yard}: {m["eval_yard"]}')
@@ -2139,6 +2179,7 @@ class Run:
                                                          **gk))
             if pg:
                 m['eval_random']['per_game'] = G.summarize_games(pg)
+            self.eval_single_games(m['eval_random'], pg)
             if tag != 'visits':
                 m['eval_random']['select'] = tag
             self.log(f'iter {it} vs random: {m["eval_random"]}')
