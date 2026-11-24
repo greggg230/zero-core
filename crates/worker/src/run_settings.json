@@ -586,6 +586,10 @@
    "class": "trainer",
    "why": "orchestration (the farm pool, docs/az.md 45)"
   },
+  "pool_live_start": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool's start counts as live, docs/az.md 84)"
+  },
   "pool_min_agent": {
    "class": "trainer",
    "why": "orchestration (the farm pool, docs/az.md 45)"
