@@ -10556,6 +10556,51 @@ toy match with classic and rolling leases, and for a spec the package cannot cou
 evaluation's count (untraced, traced, a wrong digest, a missing id); the report's split; a toy and a toy_match run's
 rows end to end. **Measured**: nothing on a live run yet - the farm side needs the coordinator of PROTOCOL rev 30.
 
+## 83. The torch worker's "CUDA out of memory" on an empty card: the job's memory limit (no setting; zero-farm's torch runtime, 2026-11-24)
+
+(Section 82 is the single-game counts of branch feat/single-game-counts.)
+
+**What happened.** A torch worker (section 80) on a PC with an RTX 5090, 801 games in flight in one group, died with
+`OutOfMemoryError: CUDA out of memory. Tried to allocate 26.00 MiB. GPU 0 has a total capacity of 31.84 GiB of which
+25.65 GiB is free. Of the allocated memory 3.71 GiB is allocated by PyTorch, with 716.55 MiB allocated in private pools
+(e.g., CUDA Graphs), and 546.84 MiB is reserved by PyTorch but unallocated` - in the warm-up run of a new CUDA graph
+(`infer.TokenGraphRunner._graph`, a batch shape not seen before). An earlier worker of the same day died the same way
+(40 MiB asked, 25.20 GiB free).
+
+**Cause.** Not the card, and nothing in the worker: it sets no per-process share of the video memory (the message
+would name the allowed amount), and it is not fragmentation - PyTorch held only 547 MiB it could not use and asked the
+driver for a new block, which the driver refused with 25 GB free. The refusal came from the host: the farm agent runs
+each worker in a Windows job object with a memory limit (committed memory of the job's processes), and on Windows a
+video memory allocation is also charged to the process's commit. The agent had read the worker at 10,922 MB of its
+11,543 MB limit 129 s before the error and at more than 11,400 MB (98.9 %) 79 s before, still rising; the earlier
+worker at 11,320 of 12,214 MB 22 s before. A later worker of that day shows what such a commit holds: up to 10.5 GB
+committed with 4.5 GB resident in its last beat, and 2.8-5.0 GB of video memory held by the agent's readings. Both workers had been told to finish their games (to go on with fewer) and went on growing: a drain's batches
+shrink through new padded shapes, each a new graph with a warm-up run of its own.
+
+**What changed here.** The fatal error says which memory ran out. `farm_torch_worker.host_memory()` reads the job
+this process runs in (`QueryInformationJobObject` with a null handle: its memory limit and peak; the process's private
+commit; None off Windows or when a call fails), and `oom_note(message, host)` puts a note in front of an out-of-memory
+message - `[the job's memory limit refused the allocation, not the GPU: the job's memory limit is 11543 MB, its peak
+11540 MB, this process commits 11200 MB; the GPU had 26266 MB free]` when the job's peak is at 97 % of its limit;
+`[the GPU had room: the host's memory (its commit limit) refused the allocation: ...]` when the message's own numbers
+show room (1 GB free and eight times what was asked) and the job is short of its limit; the bare numbers otherwise. The
+message itself follows unchanged (the agent tells a video memory failure from a host one by it), and any other error is
+reported as before.
+
+**Where the fix is.** In the farm agent (zero-farm agent 0.3.22, PROTOCOL 10.6 / 19.5): the memory plan's base for a
+torch worker is measured instead of a constant, an out-of-memory with room on the card counts as the job's memory, and a
+worker that finishes its games near the limit ends them before it runs into it.
+
+**Not done here (needs a GPU measurement).** (1) What the commit of a torch worker is made of on Windows - how much of
+it is video memory - was read from beats, not measured; `nvidia-smi` beside the job's commit over a lease would say. (2)
+A drain could reuse a captured graph of the next larger row count instead of capturing one per shrinking shape (padding
+rows cost GPU time, a new graph costs memory and a warm-up); whether results stay bit-identical under bf16 autocast at
+another padded size has to be checked on a GPU first.
+
+**Tests.** tests/test_farm_torch_worker.py `test_an_out_of_memory_error_says_which_memory_ran_out` (the two causes, a
+full card, other errors, the reading on this process) and `test_a_failed_jobs_out_of_memory_error_carries_the_note`
+(the note reaches the fatal error). No GPU needed.
+
 ## 84. No local burst while the farm starts: `pool_live_start` (run setting, off by default; zero-farm's stew specialists, 2026-11-24)
 
 **Why.** A run with `selfplay_local` 0 leaves its self-play to the farm pool while the pool is "live" (`Pool.live`,

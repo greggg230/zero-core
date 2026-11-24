@@ -373,6 +373,72 @@ def test_the_worker_makes_no_sample_rows(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------- one CUDA graph capture at a time (docs/az.md 81.3)
+OOM = ('CUDA out of memory. Tried to allocate 26.00 MiB. GPU 0 has a total capacity of 31.84 GiB of which 25.65 GiB is '
+       'free. Of the allocated memory 3.71 GiB is allocated by PyTorch, with 716.55 MiB allocated in private pools (e.g., '
+       'CUDA Graphs), and 546.84 MiB is reserved by PyTorch but unallocated.')
+
+
+def test_an_out_of_memory_error_says_which_memory_ran_out():
+    """docs/az.md 83: the worker of 2026-11-24 died "CUDA out of memory" with 25 GB of the card free - its job stood at
+    its memory limit. The fatal error now says so, the message itself unchanged after the note."""
+    assert W._size_mb(OOM, 'Tried to allocate') == 26
+    assert round(W._size_mb(OOM, 'of which')) == 26266
+    assert W._size_mb(OOM, 'nothing here') is None and W._size_mb('Tried to allocate lots', 'Tried to allocate') is None
+    # the job at its limit: that is the cause, whatever the card says
+    at = W.oom_note(OOM, {'limit_mb': 11543, 'peak_mb': 11540, 'commit_mb': 11200})
+    assert at.startswith("[the job's memory limit refused the allocation, not the GPU: the job's memory limit is 11543 MB, "
+                         'its peak 11540 MB, this process commits 11200 MB; the GPU had 26266 MB free] ')
+    # room on the card and the job short of its limit (or none): the host's commit limit
+    for host in ({'limit_mb': 26000, 'peak_mb': 12000, 'commit_mb': 11000}, {'limit_mb': 0, 'peak_mb': 0, 'commit_mb': 900}, None):
+        assert W.oom_note(OOM, host).startswith('[the GPU had room: the host'), host
+    assert 'no job memory limit, this process commits 900 MB' in W.oom_note(OOM, {'limit_mb': 0, 'peak_mb': 0, 'commit_mb': 900})
+    # a card that is full: the facts only, no other cause named
+    full = OOM.replace('25.65 GiB is free', '12.00 MiB is free')
+    note = W.oom_note(full, {'limit_mb': 26000, 'peak_mb': 12000, 'commit_mb': 11000})
+    assert note.startswith("[the job's memory limit is 26000 MB") and 'refused' not in note and 'the GPU had 12 MB free' in note
+    assert W.oom_note(full.replace('25.65', 'x'), None) == '[the GPU had 12 MB free] '
+    # a host out-of-memory without the device's numbers, and any other error
+    assert W.oom_note('out of memory', None) == ''
+    assert W.oom_note('RuntimeError: shape mismatch', {'limit_mb': 100, 'peak_mb': 100, 'commit_mb': 100}) == ''
+    # this process's own reading never raises: None (no Windows, no job) or the three numbers
+    host = W.host_memory()
+    assert host is None or (set(host) == {'limit_mb', 'peak_mb', 'commit_mb'} and all(isinstance(v, int) and v >= 0 for v in host.values()))
+    if sys.platform == 'win32' and host is not None:
+        assert host['commit_mb'] > 0
+
+
+def test_a_failed_jobs_out_of_memory_error_carries_the_note(tmp_path, monkeypatch):
+    """The job thread's failure reaches the agent as the fatal error, with the note in front of an out-of-memory message
+    (`_serve_job`)."""
+    class Boom:
+        status_s, device = 1e9, None
+
+        def __init__(self, *a, **k):
+            pass
+
+        def run(self):
+            raise MemoryError(OOM)
+
+    monkeypatch.setattr(W, 'Job', Boom)
+    monkeypatch.setattr(W, 'host_memory', lambda: {'limit_mb': 1000, 'peak_mb': 990, 'commit_mb': 950})
+    events = []
+
+    class Out:
+        def event(self, ev, **kw):
+            events.append((ev, kw))
+
+        def log(self, *a, **k):
+            pass
+
+    q = queue.Queue()
+    q.put(None)
+    W._serve_job('{}', str(tmp_path), Out(), q, 'b')
+    fatal = [kw['message'] for ev, kw in events if ev == 'error' and kw.get('fatal')]
+    assert len(fatal) == 1, events
+    assert fatal[0].startswith("MemoryError: [the job's memory limit refused the allocation, not the GPU: ")
+    assert fatal[0].endswith(OOM)
+
+
 def test_cuda_graph_captures_never_overlap(monkeypatch):
     """Two evaluators capturing at once (the worker's checkpoint thread building the next evaluator while the one in
     play meets a new batch shape) share torch's one capture stream: CUDA invalidated the capture and the lease died

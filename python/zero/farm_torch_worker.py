@@ -1100,6 +1100,102 @@ def serve(build_dir, repo, out=None, stdin_q=None, hello_sent=False):
             out.event('error', message=f'op {op!r} before a job', fatal=False)
 
 
+def host_memory():
+    """Windows: the memory of the job object this process runs in (the agent's: it limits what the worker and anything it
+    starts may commit, zero-farm PROTOCOL 5) -> {'limit_mb' (0: none), 'peak_mb' (the most the job committed),
+    'commit_mb' (this process's private commit now)}; None where that is not known (no Windows, no job, a failed
+    call). Never raises: it is read while a failure is being reported."""
+    if sys.platform != 'win32':
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class Basic(ctypes.Structure):
+            _fields_ = [('PerProcessUserTimeLimit', ctypes.c_int64), ('PerJobUserTimeLimit', ctypes.c_int64),
+                        ('LimitFlags', wintypes.DWORD), ('MinimumWorkingSetSize', ctypes.c_size_t),
+                        ('MaximumWorkingSetSize', ctypes.c_size_t), ('ActiveProcessLimit', wintypes.DWORD),
+                        ('Affinity', ctypes.c_size_t), ('PriorityClass', wintypes.DWORD),
+                        ('SchedulingClass', wintypes.DWORD)]
+
+        class Extended(ctypes.Structure):
+            _fields_ = [('BasicLimitInformation', Basic), ('IoInfo', ctypes.c_uint64 * 6),
+                        ('ProcessMemoryLimit', ctypes.c_size_t), ('JobMemoryLimit', ctypes.c_size_t),
+                        ('PeakProcessMemoryUsed', ctypes.c_size_t), ('PeakJobMemoryUsed', ctypes.c_size_t)]
+
+        class Counters(ctypes.Structure):
+            _fields_ = [('cb', wintypes.DWORD), ('PageFaultCount', wintypes.DWORD)] + [
+                (n, ctypes.c_size_t) for n in ('PeakWorkingSetSize', 'WorkingSetSize', 'QuotaPeakPagedPoolUsage',
+                                               'QuotaPagedPoolUsage', 'QuotaPeakNonPagedPoolUsage',
+                                               'QuotaNonPagedPoolUsage', 'PagefileUsage', 'PeakPagefileUsage',
+                                               'PrivateUsage')]
+
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                                  ctypes.c_void_p]
+        k32.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+        info = Extended()
+        # (a null job handle: the job of the calling process; 9 = JobObjectExtendedLimitInformation)
+        if not k32.QueryInformationJobObject(None, 9, ctypes.byref(info), ctypes.sizeof(info), None):
+            return None
+        c = Counters()
+        c.cb = ctypes.sizeof(c)
+        commit = c.PrivateUsage if k32.K32GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(c), c.cb) else 0
+        limited = info.BasicLimitInformation.LimitFlags & 0x200          # JOB_OBJECT_LIMIT_JOB_MEMORY
+        return {'limit_mb': int(info.JobMemoryLimit >> 20) if limited else 0,
+                'peak_mb': int(info.PeakJobMemoryUsed >> 20), 'commit_mb': int(commit >> 20)}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _size_mb(text, before):
+    """The size a message gives after `before` ('Tried to allocate 26.00 MiB', 'of which 25.65 GiB is free') in MB;
+    None when it gives none."""
+    i = text.find(before)
+    if i < 0:
+        return None
+    words = text[i + len(before):].split()
+    try:
+        n, unit = float(words[0]), words[1].rstrip('.,;')
+    except (IndexError, ValueError):
+        return None
+    scale = {'KiB': 1 / 1024, 'MiB': 1, 'GiB': 1024}.get(unit)
+    return None if scale is None else n * scale
+
+
+# A job that committed this share of its memory limit ran into it (zero-farm's agent: rolling.rs HIT_SHARE).
+JOB_LIMIT_HIT = 0.97
+
+
+def oom_note(message, host):
+    """What to say before an out-of-memory error's own message (docs/az.md 83): '' for anything else. PyTorch's "CUDA out
+    of memory" names the device's free memory, and on Windows a device allocation is also charged to the process's
+    commit - so the driver refuses one on an empty card when the worker's job stands at its memory limit (or the PC at
+    its commit limit). `host`: `host_memory()`'s reading, or None. The note says which memory ran out, with the
+    numbers; the message itself follows unchanged."""
+    if 'out of memory' not in message.lower():
+        return ''
+    asked, free = _size_mb(message, 'Tried to allocate'), _size_mb(message, 'of which')
+    limit, peak = (host or {}).get('limit_mb', 0), (host or {}).get('peak_mb', 0)
+    facts = []
+    if host:
+        facts.append(f"the job's memory limit is {limit} MB, its peak {peak} MB, this process commits "
+                     f"{host.get('commit_mb', 0)} MB" if limit else
+                     f"no job memory limit, this process commits {host.get('commit_mb', 0)} MB")
+    if free is not None:
+        facts.append(f'the GPU had {free:.0f} MB free')
+    at_limit = bool(limit) and peak >= JOB_LIMIT_HIT * limit
+    room = free is not None and asked is not None and free >= 1024 and free >= 8 * asked
+    if at_limit:
+        cause = "the job's memory limit refused the allocation, not the GPU"
+    elif room:
+        cause = "the GPU had room: the host's memory (its commit limit) refused the allocation"
+    else:
+        return f"[{'; '.join(facts)}] " if facts else ''
+    return f"[{cause}: {'; '.join(facts)}] "
+
+
 def _serve_job(line, base, out, q, bid):
     ctl, progress = Control(), Progress()
     try:
@@ -1117,7 +1213,8 @@ def _serve_job(line, base, out, q, bid):
         except BaseException as e:  # noqa: BLE001 - every failure reaches the agent
             import traceback
             out.log(traceback.format_exc())
-            box['error'] = f'{type(e).__name__}: {e}'
+            # (an out-of-memory error says which memory ran out: the job's limit or the GPU's, docs/az.md 83)
+            box['error'] = f'{type(e).__name__}: {oom_note(str(e), host_memory())}{e}'
         finally:
             ctl.released.set()
             with ctl.mu:
