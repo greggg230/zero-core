@@ -651,6 +651,35 @@ def test_selfplay_local_0_leaves_the_games_to_a_delivering_farm(pool):
         rp.close()
 
 
+def test_pool_live_start_plays_no_burst_while_the_farm_starts(pool):
+    """docs/az.md 84: with pool_live_start the pool's start and each generation it registers count as a game would - this
+    machine plays nothing while the farm's first leases start, and plays again once the farm stays quiet for
+    pool_live_s after the last of them; a stopped pool is never live."""
+    from zero.remoteplay import RemotePlay
+    fake, R, _ = pool
+    R.cfg.update(selfplay_local=0, pool_live_s=2.0, pool_live_start=True)
+    seed = FP.coordinator_seed(FARM)
+    rp = RemotePlay(R, R.cfg['selfplay_remote'])
+    try:
+        rp.local(2, 8)
+        rp.begin(1)
+        assert rp.local_cap() == 0, 'the pool has just started: this machine plays nothing'
+        wait(lambda: 0 in fake.ckpts, 'gen 0 registered')
+        (p,) = rp.pools.values()
+        assert p.t_reg is not None and p.live()
+        assert rp.local_cap() == 0, 'gen 0 just registered, no farm game yet: still nothing here'
+        wait(lambda: rp.local_cap() > 0, 'no farm game for pool_live_s after the registration: this machine plays')
+        assert time.time() - p.t_reg >= 2.0
+        g = farm_games(2, seed)
+        fake.add('m_a', [[0, max(x for x, _, _ in g) + 1]], records_file(header(seed), [t for _, t, _ in g]))
+        wait(lambda: rp.local_cap() == 0, 'the farm delivers: this machine plays nothing')
+        p.stopped = {'reason': 'test', 'fix': '', 't': time.time()}
+        assert not p.live(), 'a stopped pool is never live'
+        p.stopped = None
+    finally:
+        rp.close()
+
+
 def test_progress_polling_never_deadlocks_a_draining_backlog(pool):
     """The pb3 hang (docs/az.md 55): the run's thread polls RemotePlay.progress (RemotePlay.mu, then each pool's mu)
     while the pool's thread drains a large held backlog into the quota (once Pool.mu, then RemotePlay.mu per game) -

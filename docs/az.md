@@ -153,6 +153,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `pool_rolling` | 'auto' | the farm run's rolling self-play leases (zero-farm PROTOCOL rev 15, section 10: `selfplay.rolling`): a JSON object of `inflight`, `gpu_inflight` (1 to 4,096 or `auto`), `block`, `max_s`, `flush_s`, or `auto` = both in-flight counts `auto`; the worker build must announce the feature `rolling`, and the pool then judges staleness per row (rows of a network older than i - 1 - `pool_max_stale` dropped, the rest of the game kept); '' = off: classic leases, every PUT and judgement as before - and what a worker build without the feature needs (the pool refuses it while this is set); the default 'auto' since 2026-11-17 is a deliberate change (54.7); it matters only with a farm pool (`selfplay_remote` names `pool:`) (54) |
 | `pool_export` | '' | the graph the farm pool exports each generation as (`zero.onnx_export.GRAPHS`): '' the default graph, as before; 'fast' the fast zero-onnx/2 graph - TokenNet's own arithmetic, the same interface (plus the optional input `t_align`, 66), metadata (plus `fast`, `attention`, `t_align`) and answers within the parity gate's 2e-5, about half the CPU time (MultiHeadAttention, opset 17); 'fast-att23' (ONNX's opset-23 Attention: the fastest on the CPU, but the CUDA pack runs a dozen of its operators on the CPU) and 'fast-matmul'; each variant its own weight-swap template (its fingerprint); trainer-only: no worker build needs it; it matters only with a farm pool (63) |
 | `pool_variants` | '' | model variants the farm pool exports and registers beside each generation's graph (zero-farm PROTOCOL rev 20, 14): 'name=form[@vendor],...' (forms: 'fp16' - `onnx_export.to_float16` of the gen's graph; 'matmul' - the gen exported as graph 'fast-matmul', float32: the AMD GPUs' DirectML variant; 'matmul-fp16' - that graph in float16: DirectML on NVIDIA / Intel, 46.10; 'fixed-fp16' - the gen exported as graph 'fast-fixed', float16: CUDA PCs replay it as CUDA graphs, 79; 'fixed' - that graph in float32; 'weights' - the gen's network as torch-weights/1 for the alternates whose pack is opted in, the farm's torch worker, 80); each signed in the definition (`checkpoints[gen].variants`) and registered (`variants`), the run's GPU alternates naming theirs (`model`: the variant of their vendor, else the first without `@vendor`), so with 'gpu=fp16,dml=matmul@amd' CUDA PCs play the fp16 graph, AMD PCs (DirectML) the float32 MatMul one and every other machine the default; raises the run's min_agent to 0.3.5 (agents before it refuse such a definition: the stable channel must have 0.3.5 first); trainer-only (67) |
+| `pool_live_start` | false | with `selfplay_local` 0, the farm pool also counts as taking work for `pool_live_s` after the trainer's start and after each generation it registers, not only after each valid game, so a restarted trainer plays no local burst while the farm's first leases start (the export, the coordinator's first lease, the pack, the first games); a pool stopped by a refusal is never live then; false = only a game counts, as before; trainer-only (84) |
 | `selfplay_local_reason` | '' | why the run's self-play stays on this machine although the game package has a published farm build for its commit (`GamePackage.farm_build`): free text, logged at every start. Required (else refused, exit 78) at a fresh start and at a fork's first start when there is such a build and self-play names no farm pool; a resumed run only warns. `$ZERO_SELFPLAY_LOCAL_REASON` stands in for it (test harnesses, smokes; not saved). Trainer-only (70) |
 | `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); once STOP is there, the seconds the end of a phase still waits for the remote's last shards (later ones are dropped, the phase marked `cut`); without STOP it waits for every one (47.4; before 2026-11-12 this bound applied always) |
 | `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
@@ -10554,3 +10555,35 @@ entries and metrics for plain games (a refused record and a result with a missin
 toy match with classic and rolling leases, and for a spec the package cannot count (the ack of before); a farm
 evaluation's count (untraced, traced, a wrong digest, a missing id); the report's split; a toy and a toy_match run's
 rows end to end. **Measured**: nothing on a live run yet - the farm side needs the coordinator of PROTOCOL rev 30.
+
+## 84. No local burst while the farm starts: `pool_live_start` (run setting, off by default; zero-farm's stew specialists, 2026-11-24)
+
+**Why.** A run with `selfplay_local` 0 leaves its self-play to the farm pool while the pool is "live" (`Pool.live`,
+section 45): a valid game arrived within `pool_live_s` (900 s). A trainer that starts has had no game yet, so the
+pool is not live and this machine plays the whole quota itself at its full concurrency until the first farm game is
+accepted. On the first stew (2026-11-23, MTG Zero, every specialist turn and every re-pin restarts the trainer) that
+start-up takes 10-25 minutes: the generation's export and registration, the coordinator's first lease, the worker's
+pack, the first games of a best-of-three match. The local burst meanwhile ran ~1,536 games at once on the GPU the
+farm's own worker on that machine wanted, and the trainer apparently kept that memory committed afterwards (games in
+flight play out; the driver is never released; read from outside, not measured), RAM the farm agent then could not use.
+
+**What it does.** With `pool_live_start` true, the pool's start (`t_start`, the pool object's creation) and each
+generation it registers in this process (`t_reg`, after the coordinator's `PUT .../checkpoint/<gen>`) count as a game
+would: `live()` is `now - max(last game, start, last registration) < pool_live_s`. So this machine takes no games
+while the farm starts, and still takes the quota back when the farm stays quiet - `pool_live_s` after the last of
+those three, the run never stalls for good. A pool stopped by a definitive refusal (section 70) is never live with the
+setting on (without it, a stopped pool's last game ages out as before). Nothing else changes: the quota, the shards,
+the metrics, the farm's definitions and leases are the same.
+
+**Off by default**: false = `live()` exactly as before (only a game counts). Turn it on in the run's config with
+`selfplay_local` 0; it means nothing without a farm pool. Trainer-only: no worker or definition reads it.
+
+**Costs.** When the farm is down at a trainer's start, this machine waits up to `pool_live_s` (after the start, or
+after a registration that happens meanwhile) before it plays - at most ~2 x 900 s with the default, where it played
+at once before.
+
+**Tests.** tests/test_farm_pool.py `test_pool_live_start_plays_no_burst_while_the_farm_starts`: nothing local right
+after the start and right after gen 0's registration with no farm game; local again after `pool_live_s` of quiet
+after the registration; a farm game turns it off again; a stopped pool is not live.
+`test_selfplay_local_0_leaves_the_games_to_a_delivering_farm` (the setting off) is unchanged and passes.
+**Measured**: not yet on a live run (the first stew's next specialist turn).

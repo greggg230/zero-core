@@ -359,6 +359,10 @@ DEFAULTS = dict(
     # with selfplay_local 0, the pool counts as a remote taking work while a valid game arrived within this many
     # seconds (this machine then only trains; when the farm goes quiet it plays again: the run never stalls)
     pool_live_s=900.0,
+    # with selfplay_local 0, the pool also counts as taking work for pool_live_s after the trainer's start and after
+    # each generation it registers, until a game arrives (docs/az.md 84: no local burst while the farm's first leases
+    # start). False = only a game counts, as before
+    pool_live_start=False,
     # why the run's self-play stays on this machine although a published farm build exists for its commit (the game
     # package's `farm_build`; docs/az.md 70): free text, logged at every start. Required at a fresh start and at a fork's
     # first start when there is such a build and self-play names no farm pool ('' there: refused, exit 78); a resumed

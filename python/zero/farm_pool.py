@@ -497,6 +497,7 @@ class Pool:
         self.needs_ram = int(setting('pool_needs_ram_mb') or 0)
         self.poll_s = float(setting('pool_poll_s'))
         self.live_s = float(setting('pool_live_s'))
+        self.live_start = bool(setting('pool_live_start'))
         self.key = str(setting('pool_key') or '') or None
         self.farm_release = str(setting('pool_farm_release') or '') or None
         self.expires_days = setting('pool_expires_days')
@@ -564,6 +565,8 @@ class Pool:
         self.cur = self._counters(None)
         self.want = None                           # the iteration whose checkpoint (it - 1) should be published
         self.t_game = None                         # when the last valid game arrived (`live`)
+        self.t_start = time.time()                 # (pool_live_start: this process's start and its last registration)
+        self.t_reg = None
         self.closed = False
         self.error = None
         self.stopped = None                        # a definitive refusal stopped the pool: {reason, fix, t} (docs/az.md 70)
@@ -610,8 +613,14 @@ class Pool:
 
     def live(self):
         """The farm is delivering: a valid game arrived within `pool_live_s` (selfplay_local 0: this machine plays no
-        games meanwhile - RemotePlay._refresh; once the farm goes quiet for that long, it plays again)."""
+        games meanwhile - RemotePlay._refresh; once the farm goes quiet for that long, it plays again). With
+        `pool_live_start` (docs/az.md 84) the pool's start and each generation it registers count as a game would,
+        so this machine plays no burst while the farm's first leases start; a stopped pool is never live then."""
         t = self.t_game
+        if self.live_start:
+            if self.stopped:
+                return False
+            t = max(x for x in (t, self.t_start, self.t_reg) if x is not None)
         return t is not None and time.time() - t < self.live_s
 
     def describe(self):
@@ -1029,6 +1038,7 @@ class Pool:
         self.client.call('PUT', f'/v1/admin/run/{self.farm}/checkpoint/{gen}', body=body)
         g['registered'] = True
         st['current_gen'] = gen
+        self.t_reg = time.time()
         # (alternates or pool_gpu_games_per_lease changed on a resumed run: PUT again, now that a definition lists the
         # alternates' builds; a state without `put_extras` sent neither)
         extras = self._put_extras()
